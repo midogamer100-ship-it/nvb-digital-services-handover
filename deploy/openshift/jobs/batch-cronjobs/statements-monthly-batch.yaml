@@ -1,0 +1,88 @@
+# Monthly statements for the previous Africa/Cairo calendar month, on the 2nd at 02:30 local time.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: statements-monthly-batch
+  labels:
+    app.kubernetes.io/part-of: nvb-digital
+spec:
+  schedule: "30 2 2 * *"
+  timeZone: Africa/Cairo
+  suspend: true            # enable deliberately (runbook step 13): oc patch cronjob/statements-monthly-batch -p '{"spec":{"suspend":false}}'
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 3            # the command is idempotent and resumable (same idempotency key)
+      activeDeadlineSeconds: 1800
+      ttlSecondsAfterFinished: 604800
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: statements-ops
+            app.kubernetes.io/part-of: nvb-digital
+            nvb.io/component: statements-ops
+        spec:
+          serviceAccountName: statements-ops
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          terminationGracePeriodSeconds: 30
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+          - name: statements-ops
+            image: nvb-statements
+            imagePullPolicy: IfNotPresent
+            command: ["python", "-m", "nvb_statements.batch", "create", "--period", "previous-month", "--trigger", "schedule"]
+            envFrom:
+            - configMapRef:
+                name: statements-config
+            env:
+            - name: STATEMENTS_DATABASE_PASSWORD_FILE
+              value: "/var/run/secrets/nvb/db/password"
+            - name: STATEMENTS_ADAPTER_TOKEN_FILE
+              value: "/var/run/secrets/nvb/adapter/token"
+            - name: STATEMENTS_ADAPTER_CA_FILE
+              value: "/etc/nvb/service-ca/service-ca.crt"
+            resources:
+              requests: {cpu: 50m, memory: 128Mi}
+              limits: {cpu: 500m, memory: 384Mi}
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              runAsNonRoot: true
+              capabilities:
+                drop: ["ALL"]
+              seccompProfile:
+                type: RuntimeDefault
+            volumeMounts:
+            - name: db
+              mountPath: /var/run/secrets/nvb/db
+              readOnly: true
+            - name: adapter-token
+              mountPath: /var/run/secrets/nvb/adapter
+              readOnly: true
+            - name: service-ca
+              mountPath: /etc/nvb/service-ca
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          volumes:
+          - name: db
+            secret:
+              secretName: statements-db-app
+              defaultMode: 0440
+          - name: adapter-token
+            secret:
+              secretName: adapter-token-statements-batch
+              defaultMode: 0440
+          - name: service-ca
+            configMap:
+              name: nvb-service-ca
+          - name: tmp
+            emptyDir:
+              sizeLimit: 256Mi

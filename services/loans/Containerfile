@@ -1,0 +1,50 @@
+# NVB Loans image: loans-api, loans-relay, loans-worker, batch command, role command AND the loans migrations (one immutable image, different commands).
+# BUILD CONTEXT = REPOSITORY ROOT (the image needs libs/, services/ and migrations/):
+#   podman build -f services/loans/Containerfile --build-arg REVISION=$(git rev-parse HEAD) --build-arg VERSION=<version> \
+#       -t <registry>/nvb-loans:<version> .
+# (scripts/build-images.sh does this for every image and records the digests.)
+# OpenShift: runs as an arbitrary non-root UID in group 0; application files are read-only; only
+# /tmp (emptyDir) is writable. No credentials are baked in. No git, no "git pull" at start-up:
+# the image IS the release.
+# TODO(infra): pin the base image by digest once the registry mirror is agreed.
+ARG BASE_IMAGE=registry.access.redhat.com/ubi9/python-312:latest
+FROM ${BASE_IMAGE} AS build
+USER 0
+WORKDIR /build
+COPY services/loans/requirements.txt requirements.txt
+RUN python -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
+ && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
+
+FROM ${BASE_IMAGE}
+ARG REVISION=unknown
+ARG VERSION=0.0.0
+LABEL org.opencontainers.image.title="nvb-loans" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.source="nvb-digital-services" \
+      org.opencontainers.image.description="NVB loan applications extension (workflow only, no disbursement) - synthetic demo data only"
+USER 0
+COPY --from=build /opt/venv /opt/venv
+COPY libs/nvb_platform/nvb_platform /opt/app/nvb_platform
+COPY services/loans/nvb_loans /opt/app/nvb_loans
+COPY migrations/loans /opt/app/migrations/loans
+RUN chown -R 0:0 /opt/app /opt/venv && chmod -R g=u-w,o-w /opt/app && chmod -R a-w /opt/app
+ENV PATH=/opt/venv/bin:$PATH \
+    PYTHONPATH=/opt/app \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TMPDIR=/tmp \
+    LOANS_BUILD_REVISION=${REVISION}
+WORKDIR /opt/app
+USER 1001
+EXPOSE 8443
+# Default command = loans-api. Other components override the command:
+#   relay     : ["python", "-m", "nvb_loans.relay"]
+#   worker    : ["python", "-m", "nvb_loans.worker", "--drain"]                (Job / KEDA ScaledJob)
+#   batch     : ["python", "-m", "nvb_loans.relay", "batch-create", "--trigger", "schedule"]  (CronJob)
+#   roles     : ["python", "-m", "nvb_loans.admin", "grant", ...]              (one-off Job)
+#   migration : ["alembic", "-c", "/opt/app/migrations/loans/alembic.ini", "upgrade", "head"]
+# TLS: set UVICORN_SSL_CERTFILE / UVICORN_SSL_KEYFILE (uvicorn reads UVICORN_* variables) to the
+# mounted service-serving certificate. uvicorn handles SIGTERM gracefully (in-flight requests finish).
+CMD ["uvicorn", "--factory", "nvb_loans.api:app_factory", "--host", "0.0.0.0", "--port", "8443", \
+     "--timeout-graceful-shutdown", "20", "--no-server-header"]

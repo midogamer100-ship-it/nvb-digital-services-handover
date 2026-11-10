@@ -1,0 +1,13 @@
+# Application workloads only (no dependencies, no Jobs, no autoscaling). Never applied directly:
+# use an overlay (overlays/test or overlays/poc), which sets the namespace, the images (by digest)
+# and the environment-specific ConfigMaps / NetworkPolicy patches.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- serviceaccounts.yaml
+- service-ca.yaml
+- core-adapter.yaml
+- statements.yaml
+- loans.yaml
+- gateway.yaml
+- networkpolicies.yaml

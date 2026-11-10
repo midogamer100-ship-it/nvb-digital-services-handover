@@ -1,0 +1,32 @@
+# NVB gateway + portal image (nginx). HTTP-aware same-origin gateway and the static portal.
+# BUILD CONTEXT = REPOSITORY ROOT:
+#   podman build -f gateway/Containerfile --build-arg REVISION=$(git rev-parse HEAD) --build-arg VERSION=<version> \
+#       -t <registry>/nvb-gateway:<version> .
+# The portal is plain static files (no build step, no third-party JavaScript). The nginx
+# configuration is rendered at start from GATEWAY_* variables by gateway/render_config.py
+# (python3 standard library only; python3 is part of the UBI 9 base - verify at the first build).
+# Runs as an arbitrary non-root UID; writes only under /tmp (emptyDir).
+# TODO(infra): pin the base image by digest once the registry mirror is agreed.
+ARG BASE_IMAGE=registry.access.redhat.com/ubi9/nginx-124:latest
+FROM ${BASE_IMAGE}
+ARG REVISION=unknown
+ARG VERSION=0.0.0
+LABEL org.opencontainers.image.title="nvb-gateway" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.source="nvb-digital-services" \
+      org.opencontainers.image.description="NVB digital gateway and portal - synthetic demo data only"
+USER 0
+COPY gateway/nginx.conf.template gateway/render_config.py gateway/entrypoint.sh /opt/gateway/
+COPY portal /opt/portal
+RUN python3 --version && nginx -v \
+ && chown -R 0:0 /opt/gateway /opt/portal && chmod -R a-w /opt/gateway /opt/portal \
+ && chmod 0555 /opt/gateway/entrypoint.sh
+ENV GATEWAY_PORTAL_ROOT=/opt/portal \
+    GATEWAY_RUN_DIR=/tmp/nginx \
+    GATEWAY_LISTEN=8443 \
+    GATEWAY_BUILD_REVISION=${REVISION}
+USER 1001
+EXPOSE 8443
+STOPSIGNAL SIGQUIT
+CMD ["/opt/gateway/entrypoint.sh"]

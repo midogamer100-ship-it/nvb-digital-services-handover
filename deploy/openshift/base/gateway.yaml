@@ -1,0 +1,144 @@
+# Gateway + portal: the single browser origin. NEW Route with its own hostname and re-encrypt TLS
+# (router terminates the public certificate, re-encrypts to the pod, and verifies the pod's
+# service-serving certificate). The existing core Route / HAProxy passthrough is NOT touched.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: nvb-digital
+    nvb.io/component: gateway
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector:
+    matchLabels:
+      nvb.io/component: gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gateway
+        app.kubernetes.io/part-of: nvb-digital
+        nvb.io/component: gateway
+    spec:
+      serviceAccountName: gateway
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: gateway
+        image: nvb-gateway
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: https
+          containerPort: 8443
+        envFrom:
+        - configMapRef:
+            name: gateway-config
+        env:
+        - name: GATEWAY_TLS_CERT_FILE
+          value: "/etc/nvb/tls/tls.crt"
+        - name: GATEWAY_TLS_KEY_FILE
+          value: "/etc/nvb/tls/tls.key"
+        - name: GATEWAY_INTERNAL_CA_FILE
+          value: "/etc/nvb/service-ca/service-ca.crt"
+        - name: GATEWAY_RUN_DIR
+          value: "/tmp/nginx"
+        startupProbe:
+          httpGet: {path: /gateway/health, port: https, scheme: HTTPS}
+          periodSeconds: 3
+          failureThreshold: 20
+        livenessProbe:
+          httpGet: {path: /gateway/health, port: https, scheme: HTTPS}
+          periodSeconds: 20
+        readinessProbe:
+          httpGet: {path: /gateway/health, port: https, scheme: HTTPS}
+          periodSeconds: 10
+        resources:
+          requests: {cpu: 25m, memory: 64Mi}
+          limits: {cpu: 300m, memory: 192Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          capabilities:
+            drop: ["ALL"]
+          seccompProfile:
+            type: RuntimeDefault
+        volumeMounts:
+        - name: tls
+          mountPath: /etc/nvb/tls
+          readOnly: true
+        - name: service-ca
+          mountPath: /etc/nvb/service-ca
+          readOnly: true
+        - name: core-ca
+          mountPath: /etc/nvb/core-ca
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tls
+        secret:
+          secretName: gateway-tls
+          defaultMode: 0440
+      - name: service-ca
+        configMap:
+          name: nvb-service-ca
+      - name: core-ca
+        configMap:
+          name: core-ca
+      - name: tmp
+        emptyDir:
+          sizeLimit: 256Mi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: nvb-digital
+    nvb.io/component: gateway
+  annotations:
+    # OpenShift service CA issues gateway-tls for gateway.<namespace>.svc (no operator to install).
+    service.beta.openshift.io/serving-cert-secret-name: gateway-tls
+spec:
+  selector:
+    nvb.io/component: gateway
+  ports:
+  - name: https
+    port: 8443
+    targetPort: https
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: nvb-digital
+  labels:
+    app.kubernetes.io/part-of: nvb-digital
+    nvb.io/component: gateway
+  annotations:
+    haproxy.router.openshift.io/timeout: 90s
+    haproxy.router.openshift.io/hsts_header: max-age=31536000
+spec:
+  # host: set in the overlay (must equal the host in GATEWAY_PUBLIC_ORIGIN)
+  to:
+    kind: Service
+    name: gateway
+    weight: 100
+  port:
+    targetPort: https
+  tls:
+    termination: reencrypt
+    insecureEdgeTerminationPolicy: Redirect
+    # destinationCACertificate omitted: the router trusts the service CA for service-serving certs.
+  wildcardPolicy: None

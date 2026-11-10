@@ -1,0 +1,17 @@
+# Build context is the repository root; keep it small and free of local state/secrets.
+.git
+.local
+.venv
+**/__pycache__
+**/*.pyc
+**/tests
+tests
+docs
+deploy
+scripts
+dist
+*.env
+**/*.pem
+**/*.key
+secrets
+kubeconfig*

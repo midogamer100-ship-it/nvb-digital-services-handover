@@ -11,5 +11,5 @@ dist/
 *.pem
 *.key
 kubeconfig*
-secrets/
+/secrets/
 .local/

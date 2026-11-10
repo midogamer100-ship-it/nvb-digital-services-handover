@@ -1,0 +1,9 @@
+# One-off, controlled schema migrations. Apply explicitly BEFORE rolling out new images:
+#   oc -n <ns> apply -k deploy/openshift/overlays/<env>/migrations && oc -n <ns> wait --for=condition=complete job/statements-migrate job/loans-migrate
+# Jobs are immutable: delete the finished Job before re-applying for the next release.
+# The Jobs use the OWNER database role (DDL); the services use the least-privilege app role.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- statements-migrate.yaml
+- loans-migrate.yaml

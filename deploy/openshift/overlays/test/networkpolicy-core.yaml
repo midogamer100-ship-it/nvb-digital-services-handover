@@ -1,0 +1,33 @@
+# Egress to the ISOLATED TEST CORE (in this namespace). Nothing in this overlay can reach the
+# real core VMs, the core database VM or the bank-poc namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-to-core
+spec:
+  podSelector:
+    matchExpressions:
+    - {key: nvb.io/component, operator: In, values: [core-adapter, gateway]}
+  policyTypes: [Egress]
+  egress:
+  - to:
+    - podSelector:
+        matchLabels: {nvb.io/component: core-test}
+    ports:
+    - {protocol: TCP, port: 8443}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: core-test
+spec:
+  podSelector:
+    matchLabels: {nvb.io/component: core-test}
+  policyTypes: [Ingress, Egress]
+  ingress:
+  - from:
+    - podSelector:
+        matchExpressions:
+        - {key: nvb.io/component, operator: In, values: [core-adapter, gateway]}
+    ports:
+    - {protocol: TCP, port: 8443}

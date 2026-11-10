@@ -1,0 +1,26 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: nvb-digital
+resources:
+- ../../../jobs/worker-loans
+components:
+- ../images
+patches:
+# TLS to external dependencies (same as the Deployments in ../kustomization.yaml).
+- target: {kind: "Job|CronJob|ScaledJob"}
+  patch: |-
+    - op: add
+      path: /spec/template/spec/volumes/-
+      value: {name: deps-ca, configMap: {name: deps-ca}}
+    - op: add
+      path: /spec/template/spec/containers/0/volumeMounts/-
+      value: {name: deps-ca, mountPath: /etc/nvb/deps-ca, readOnly: true}
+    - op: add
+      path: /spec/template/spec/containers/0/env/-
+      value: {name: STATEMENTS_BROKER_CA_FILE, value: /etc/nvb/deps-ca/ca.crt}
+    - op: add
+      path: /spec/template/spec/containers/0/env/-
+      value: {name: STATEMENTS_S3_CA_FILE, value: /etc/nvb/deps-ca/ca.crt}
+    - op: add
+      path: /spec/template/spec/containers/0/env/-
+      value: {name: LOANS_BROKER_CA_FILE, value: /etc/nvb/deps-ca/ca.crt}

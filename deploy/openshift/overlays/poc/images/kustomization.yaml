@@ -1,0 +1,19 @@
+# Single place for the image references of this environment. Every kustomization of the overlay
+# includes this component, so workloads, Jobs and ScaledJobs always use the SAME release.
+# Shared PoC: use the infra-approved registry and pin every image BY DIGEST.
+# Use digests from dist/images-<version>.txt (scripts/build-images.sh):  newName + digest.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+images:
+- name: nvb-core-adapter
+  newName: REPLACE_REGISTRY/nvb-core-adapter
+  newTag: REPLACE_VERSION        # replace newTag by `digest: sha256:...` for the shared PoC
+- name: nvb-statements
+  newName: REPLACE_REGISTRY/nvb-statements
+  newTag: REPLACE_VERSION
+- name: nvb-loans
+  newName: REPLACE_REGISTRY/nvb-loans
+  newTag: REPLACE_VERSION
+- name: nvb-gateway
+  newName: REPLACE_REGISTRY/nvb-gateway
+  newTag: REPLACE_VERSION

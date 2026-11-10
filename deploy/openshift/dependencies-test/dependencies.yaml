@@ -1,0 +1,306 @@
+# DISPOSABLE test dependencies for the isolated test namespace ONLY (never the shared PoC):
+# one PostgreSQL, one RabbitMQ and one S3-compatible object store, each a single replica with a
+# small PVC. Plain StatefulSets: NO operator is installed.
+#
+# INFRA MUST CONFIRM before applying:
+#   * the three images/versions below (replace with the approved mirror + digest in the overlay
+#     `images:` list). They are the upstream images of the versions the code was integration-tested
+#     with locally (PostgreSQL 16, RabbitMQ 3.13, SeaweedFS 3.97) - not yet run on OpenShift;
+#   * the StorageClass: `storageClassName` is intentionally omitted (cluster default). Set it in the
+#     overlay if the default is not the approved class for this namespace;
+#   * capacity: requests/limits are initial ASSUMPTIONS, not measurements.
+# Data here is throw-away. Deleting the namespace (or the PVCs) deletes it; nothing is backed up.
+# In-namespace traffic to these three services is NOT TLS-encrypted in this overlay (accepted for
+# disposable synthetic data; the shared PoC overlay requires TLS endpoints instead).
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels: {app.kubernetes.io/part-of: nvb-digital-test-deps, nvb.io/component: postgres}
+spec:
+  clusterIP: None
+  selector: {nvb.io/component: postgres}
+  ports:
+  - {name: postgres, port: 5432, targetPort: 5432}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  labels: {app.kubernetes.io/part-of: nvb-digital-test-deps, nvb.io/component: postgres}
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: {nvb.io/component: postgres}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/part-of: nvb-digital-test-deps, nvb.io/component: postgres}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: postgres
+        image: test-postgres
+        ports:
+        - {name: postgres, containerPort: 5432}
+        env:
+        - name: POSTGRESQL_ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef: {name: test-postgres-admin, key: password}
+        - {name: POSTGRESQL_MAX_CONNECTIONS, value: "100"}
+        readinessProbe:
+          exec: {command: ["/usr/libexec/check-container"]}
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        livenessProbe:
+          exec: {command: ["/usr/libexec/check-container", "--live"]}
+          initialDelaySeconds: 60
+          periodSeconds: 20
+        resources:
+          requests: {cpu: 100m, memory: 256Mi}
+          limits: {cpu: "1", memory: 768Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          capabilities: {drop: ["ALL"]}
+          seccompProfile: {type: RuntimeDefault}
+        volumeMounts:
+        - {name: data, mountPath: /var/lib/pgsql/data}
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources:
+        requests: {storage: 2Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  labels: {app.kubernetes.io/part-of: nvb-digital-test-deps, nvb.io/component: rabbitmq}
+spec:
+  clusterIP: None
+  selector: {nvb.io/component: rabbitmq}
+  ports:
+  - {name: amqp, port: 5672, targetPort: 5672}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-rabbitmq-config
+  labels: {app.kubernetes.io/part-of: nvb-digital-test-deps}
+data:
+  rabbitmq.conf: |
+    # Users, vhost and permissions come from the mounted definitions (password HASHES only).
+    load_definitions = /etc/rabbitmq/definitions/definitions.json
+    loopback_users.guest = true
+    default_queue_type = quorum
+    listeners.tcp.default = 5672
+    disk_free_limit.absolute = 256MB
+    vm_memory_high_watermark.relative = 0.6
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq
+  labels: {app.kubernetes.io/part-of: nvb-digital-test-deps, nvb.io/component: rabbitmq}
+spec:
+  serviceName: rabbitmq
+  replicas: 1
+  selector:
+    matchLabels: {nvb.io/component: rabbitmq}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/part-of: nvb-digital-test-deps, nvb.io/component: rabbitmq}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 90
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: rabbitmq
+        image: test-rabbitmq
+        ports:
+        - {name: amqp, containerPort: 5672}
+        env:
+        - {name: HOME, value: /var/lib/rabbitmq}            # Erlang cookie lives on the PVC (arbitrary UID)
+        - {name: RABBITMQ_NODENAME, value: rabbit@localhost}  # single node, stable name across restarts
+        - {name: RABBITMQ_CONFIG_FILE, value: /etc/rabbitmq/conf/rabbitmq.conf}
+        readinessProbe:
+          exec: {command: ["rabbitmq-diagnostics", "-q", "check_port_connectivity"]}
+          initialDelaySeconds: 20
+          periodSeconds: 15
+          timeoutSeconds: 10
+        livenessProbe:
+          exec: {command: ["rabbitmq-diagnostics", "-q", "ping"]}
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+        resources:
+          requests: {cpu: 100m, memory: 256Mi}
+          limits: {cpu: "1", memory: 768Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          capabilities: {drop: ["ALL"]}
+          seccompProfile: {type: RuntimeDefault}
+        volumeMounts:
+        - {name: data, mountPath: /var/lib/rabbitmq}
+        - {name: config, mountPath: /etc/rabbitmq/conf, readOnly: true}
+        - {name: definitions, mountPath: /etc/rabbitmq/definitions, readOnly: true}
+      volumes:
+      - name: config
+        configMap: {name: test-rabbitmq-config}
+      - name: definitions
+        secret: {secretName: test-rabbitmq-definitions}
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources:
+        requests: {storage: 1Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: objectstore
+  labels: {app.kubernetes.io/part-of: nvb-digital-test-deps, nvb.io/component: objectstore}
+spec:
+  clusterIP: None
+  selector: {nvb.io/component: objectstore}
+  ports:
+  - {name: s3, port: 8333, targetPort: 8333}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: objectstore
+  labels: {app.kubernetes.io/part-of: nvb-digital-test-deps, nvb.io/component: objectstore}
+spec:
+  serviceName: objectstore
+  replicas: 1
+  selector:
+    matchLabels: {nvb.io/component: objectstore}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/part-of: nvb-digital-test-deps, nvb.io/component: objectstore}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: seaweedfs
+        image: test-objectstore
+        # Every request must be signed by an identity from the mounted config: the bucket is private.
+        args: ["server", "-dir=/data", "-ip.bind=0.0.0.0", "-volume.max=20", "-filer", "-s3", "-s3.port=8333",
+               "-s3.config=/etc/seaweedfs/s3.json"]
+        ports:
+        - {name: s3, containerPort: 8333}
+        readinessProbe:
+          tcpSocket: {port: 8333}
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        livenessProbe:
+          tcpSocket: {port: 8333}
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        resources:
+          requests: {cpu: 50m, memory: 128Mi}
+          limits: {cpu: 500m, memory: 512Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          capabilities: {drop: ["ALL"]}
+          seccompProfile: {type: RuntimeDefault}
+        volumeMounts:
+        - {name: data, mountPath: /data}
+        - {name: s3-config, mountPath: /etc/seaweedfs, readOnly: true}
+      volumes:
+      - name: s3-config
+        secret: {secretName: test-objectstore-config}
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources:
+        requests: {storage: 2Gi}
+---
+# Only the pods that need a dependency may reach it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: test-deps-postgres
+spec:
+  podSelector:
+    matchLabels: {nvb.io/component: postgres}
+  policyTypes: [Ingress, Egress]
+  ingress:
+  - from:
+    - podSelector:
+        matchExpressions:
+        - {key: nvb.io/component, operator: In, values: [statements-api, statements-relay, statements-worker, statements-ops, loans-api, loans-relay, loans-worker, loans-ops, test-deps-init, core-test]}
+    ports:
+    - {protocol: TCP, port: 5432}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: test-deps-rabbitmq
+spec:
+  podSelector:
+    matchLabels: {nvb.io/component: rabbitmq}
+  policyTypes: [Ingress, Egress]
+  ingress:
+  - from:
+    - podSelector:
+        matchExpressions:
+        - {key: nvb.io/component, operator: In, values: [statements-relay, statements-worker, loans-relay, loans-worker]}
+    # KEDA (if enabled) also needs AMQP access from its own namespace: add that rule with infra.
+    ports:
+    - {protocol: TCP, port: 5672}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: test-deps-objectstore
+spec:
+  podSelector:
+    matchLabels: {nvb.io/component: objectstore}
+  policyTypes: [Ingress, Egress]
+  ingress:
+  - from:
+    - podSelector:
+        matchExpressions:
+        - {key: nvb.io/component, operator: In, values: [statements-api, statements-worker, test-deps-init]}
+    ports:
+    - {protocol: TCP, port: 8333}
+---
+# Egress of the application pods to the in-namespace test dependencies.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: test-egress-to-deps
+spec:
+  podSelector:
+    matchExpressions:
+    - {key: nvb.io/component, operator: In, values: [statements-api, statements-relay, statements-worker, statements-ops, loans-api, loans-relay, loans-worker, loans-ops, test-deps-init, core-test]}
+  policyTypes: [Egress]
+  egress:
+  - to:
+    - podSelector:
+        matchExpressions:
+        - {key: nvb.io/component, operator: In, values: [postgres, rabbitmq, objectstore]}
+    ports:
+    - {protocol: TCP, port: 5432}
+    - {protocol: TCP, port: 5672}
+    - {protocol: TCP, port: 8333}

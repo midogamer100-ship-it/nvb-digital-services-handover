@@ -1,0 +1,1453 @@
+From 978ba7b3c7b20d3d0ef8f800453f2d234de40433 Mon Sep 17 00:00:00 2001
+From: Ahmed Yasser <midogamer100@gmail.com>
+Date: Tue, 10 Nov 2026 19:12:20 +0200
+Subject: [PATCH 1/2] Add optional extension integration API (/internal/v1),
+ disabled by default
+
+Additive, read-only integration surface for the extension services.
+Registered only when NVB_INTEGRATION_ENABLED=true; with the default
+(false) the router is not imported and existing behaviour is unchanged.
+
+- Scoped bearer client credentials; only SHA-256 digests stored in a
+  mounted JSON file, re-read on change (rotation without restart).
+  Missing/invalid config fails closed.
+- Session introspection reusing load_session (same expiry, logout and
+  suspension semantics) with server-side CSRF check and a stable subject.
+- statement-v1 dataset: manifest in one REPEATABLE READ READ ONLY
+  snapshot with ledger reconciliation, half-open UTC periods, settle
+  window, keyset-paginated entries without a row cap, bounded
+  concurrent exports (429), audit events.
+- Batch account discovery with explicit scope.
+- No schema change. Customer routes, require_customer, owned_account,
+  money handling and idempotency untouched.
+- Test fix: test_metrics_labels_use_route_templates_not_ids now checks
+  label values only (float samples could contain "999999").
+
+Tested on SQLite only (175 passed); PostgreSQL run pending.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ backend/app/api/integration.py              | 354 ++++++++++++++++++
+ backend/app/config.py                       |  17 +
+ backend/app/main.py                         |   6 +
+ backend/app/services/integration_exports.py | 288 ++++++++++++++
+ backend/tests/integration_support.py        |  48 +++
+ backend/tests/test_health.py                |   5 +-
+ backend/tests/test_integration_auth.py      | 232 ++++++++++++
+ backend/tests/test_integration_exports.py   | 393 ++++++++++++++++++++
+ 8 files changed, 1342 insertions(+), 1 deletion(-)
+ create mode 100644 backend/app/api/integration.py
+ create mode 100644 backend/app/services/integration_exports.py
+ create mode 100644 backend/tests/integration_support.py
+ create mode 100644 backend/tests/test_integration_auth.py
+ create mode 100644 backend/tests/test_integration_exports.py
+
+diff --git a/backend/app/api/integration.py b/backend/app/api/integration.py
+new file mode 100644
+index 0000000..5dd954c
+--- /dev/null
++++ b/backend/app/api/integration.py
+@@ -0,0 +1,354 @@
++"""Extension integration API (``/internal/v1``). Registered only when
++``NVB_INTEGRATION_ENABLED=true``.
++
++Security model
++--------------
++* Every request needs ``Authorization: Bearer <client token>``. The core stores
++  only SHA-256 digests in a JSON file mounted from a Secret
++  (``NVB_INTEGRATION_CLIENTS_FILE``); the file is re-read when it changes, so a
++  credential rotation does not need a core restart. Missing/invalid configuration
++  fails closed (401 for every request).
++* Each client has explicit scopes; each endpoint requires one of them.
++* Network placement is NOT the control: these checks run on every request.
++* Customer routes, ``require_customer`` and ``owned_account`` are untouched. This
++  router never returns full account numbers and never writes financial data.
++
++File format::
++
++    {"clients": [{"client_id": "nvb-core-adapter",
++                  "token_sha256": ["<hex digest>", "<next digest during rotation>"],
++                  "scopes": ["identity:introspect", "accounts:read", "statements:extract"]}]}
++"""
++
++from __future__ import annotations
++
++import hashlib
++import hmac
++import json
++import logging
++import os
++import threading
++import time
++from dataclasses import dataclass, field
++from datetime import datetime
++
++from fastapi import APIRouter, Depends, FastAPI, Query, Request
++from fastapi.responses import JSONResponse
++from prometheus_client import Counter
++from pydantic import BaseModel, Field
++from sqlalchemy.orm import Session
++
++from app import audit
++from app.config import Settings
++from app.db import as_utc, utcnow
++from app.models import ROLE_CUSTOMER
++from app.security import csrf_valid, load_session
++from app.services import integration_exports as ix
++
++log = logging.getLogger("nvb.integration")
++router = APIRouter(prefix="/internal/v1", tags=["integration"])
++
++SCOPES = {
++    "identity:introspect",
++    "accounts:read",
++    "statements:extract",
++    "summaries:read",
++    "accounts:discover",
++}
++MIN_TOKEN_LENGTH = 32
++RELOAD_CHECK_SECONDS = 15
++
++INTEGRATION_REQUESTS = Counter(
++    "nvb_integration_requests_total", "Integration API requests", ["endpoint", "outcome"]
++)
++
++
++# --- Client registry ------------------------------------------------------------------
++
++
++@dataclass
++class Client:
++    client_id: str
++    digests: list[str]
++    scopes: set[str]
++
++
++@dataclass
++class ClientRegistry:
++    path: str | None
++    clients: list[Client] = field(default_factory=list)
++    _mtime: float | None = None
++    _checked: float = 0.0
++    _lock: threading.Lock = field(default_factory=threading.Lock)
++
++    def _load(self) -> None:
++        if not self.path:
++            self.clients = []
++            return
++        try:
++            mtime = os.stat(self.path).st_mtime
++        except OSError:
++            log.error("integration clients file not readable; failing closed")
++            self.clients, self._mtime = [], None
++            return
++        if mtime == self._mtime:
++            return
++        try:
++            with open(self.path, encoding="utf-8") as fh:
++                raw = json.load(fh)
++            clients = []
++            for item in raw.get("clients", []):
++                scopes = set(item.get("scopes", []))
++                unknown = scopes - SCOPES
++                digests = [d.lower() for d in item.get("token_sha256", [])]
++                if unknown or not digests or not all(len(d) == 64 for d in digests):
++                    raise ValueError(f"invalid client entry {item.get('client_id')!r}")
++                clients.append(Client(str(item["client_id"]), digests, scopes))
++        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
++            log.error("integration clients file invalid; failing closed", extra={"error": str(exc)})
++            self.clients, self._mtime = [], mtime
++            return
++        self.clients, self._mtime = clients, mtime
++        log.info("integration clients loaded", extra={"clients": [c.client_id for c in clients]})
++
++    def authenticate(self, token: str | None) -> Client | None:
++        now = time.monotonic()
++        with self._lock:
++            if now - self._checked >= RELOAD_CHECK_SECONDS or self._mtime is None:
++                self._checked = now
++                self._load()
++            clients = list(self.clients)
++        if not token or len(token) < MIN_TOKEN_LENGTH or len(token) > 512:
++            return None
++        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
++        match = None
++        for c in clients:
++            for d in c.digests:
++                if hmac.compare_digest(d, digest):
++                    match = c
++        return match
++
++
++@dataclass
++class IntegrationState:
++    registry: ClientRegistry
++    exports: threading.BoundedSemaphore
++    queue_timeout: float
++
++
++def configure(app: FastAPI, settings: Settings) -> None:
++    app.state.integration = IntegrationState(
++        registry=ClientRegistry(settings.integration_clients_file),
++        exports=threading.BoundedSemaphore(settings.integration_max_concurrent_exports),
++        queue_timeout=settings.integration_export_queue_timeout_seconds,
++    )
++    install_error_handlers(app)
++    if not settings.integration_clients_file:
++        log.error("integration enabled without NVB_INTEGRATION_CLIENTS_FILE; all requests will be rejected")
++
++
++# --- Dependencies ---------------------------------------------------------------------
++
++
++class IntegrationHTTPError(Exception):
++    def __init__(self, status_code: int, code: str, message: str, headers: dict | None = None) -> None:
++        self.status_code, self.code, self.message, self.headers = status_code, code, message, headers or {}
++
++
++def _error(status_code: int, code: str, message: str, headers: dict | None = None) -> JSONResponse:
++    return JSONResponse({"error": {"code": code, "message": message}}, status_code=status_code,
++                        headers=headers or {})
++
++
++def get_db(request: Request):
++    db = request.app.state.sessionmaker()
++    try:
++        yield db
++    finally:
++        db.close()
++
++
++def require_scope(*accepted: str):
++    def dep(request: Request) -> Client:
++        state: IntegrationState = request.app.state.integration
++        header = request.headers.get("authorization", "")
++        token = header[7:].strip() if header[:7].lower() == "bearer " else None
++        client = state.registry.authenticate(token)
++        if client is None:
++            raise IntegrationHTTPError(401, "invalid_client", "Client authentication failed.",
++                                       {"WWW-Authenticate": "Bearer"})
++        if not client.scopes.intersection(accepted):
++            raise IntegrationHTTPError(403, "insufficient_scope", "Client is not permitted to call this endpoint.")
++        request.state.integration_client = client.client_id
++        return client
++
++    return dep
++
++
++class _ExportSlot:
++    """Bounded concurrency for expensive extraction queries (per core process)."""
++
++    def __init__(self, state: IntegrationState) -> None:
++        self.state = state
++
++    def __enter__(self):
++        if not self.state.exports.acquire(timeout=self.state.queue_timeout):
++            raise IntegrationHTTPError(429, "export_capacity", "Export capacity is busy; retry later.",
++                                       {"Retry-After": "2"})
++        return self
++
++    def __exit__(self, *exc):
++        self.state.exports.release()
++        return False
++
++
++def _settings(request: Request) -> Settings:
++    return request.app.state.settings
++
++
++# --- Endpoints ------------------------------------------------------------------------
++
++
++class IntrospectRequest(BaseModel):
++    session_token: str = Field(min_length=1, max_length=128)
++    csrf_token: str | None = Field(default=None, max_length=128)
++    include_accounts: bool = False
++
++
++@router.post("/sessions/introspect")
++def introspect(body: IntrospectRequest, request: Request, client: Client = Depends(require_scope("identity:introspect")),
++               db: Session = Depends(get_db)):
++    """RFC 7662-style introspection of a browser session token.
++
++    Uses the same ``load_session`` as the customer API, so idle/absolute expiry,
++    logout (row deleted), password reset (sessions deleted) and user suspension
++    behave identically. Introspection counts as session activity (slides idle expiry)
++    exactly like a direct API call would.
++    """
++    record = load_session(db, body.session_token, _settings(request))
++    if record is None:
++        INTEGRATION_REQUESTS.labels("introspect", "inactive").inc()
++        return {"active": False}
++    user = record.user
++    customer = user.customer
++    out = {
++        "active": True,
++        "subject": ix.subject_for(user),
++        "username": user.username,
++        "role": user.role,
++        "display_name": (customer.preferred_name or customer.full_name.split(" ")[0]) if customer else user.username,
++        "full_name": customer.full_name if customer else None,
++        "customer_number": customer.customer_number if customer else None,
++        "session_expires_at": as_utc(record.expires_at).isoformat(),
++        "csrf_valid": csrf_valid(record, body.csrf_token) if body.csrf_token is not None else None,
++    }
++    if body.include_accounts:
++        if "accounts:read" not in client.scopes:
++            raise IntegrationHTTPError(403, "insufficient_scope", "include_accounts requires accounts:read.")
++        out["accounts"] = ix.accounts_for_customer(db, customer) if (customer and user.role == ROLE_CUSTOMER) else []
++    db.commit()
++    INTEGRATION_REQUESTS.labels("introspect", "active").inc()
++    return out
++
++
++@router.get("/subjects/{subject}/accounts")
++def subject_accounts(subject: str, request: Request, _c: Client = Depends(require_scope("accounts:read")),
++                     db: Session = Depends(get_db)):
++    _user, customer = ix.customer_for_subject(db, subject)
++    INTEGRATION_REQUESTS.labels("subject_accounts", "ok").inc()
++    return {"subject": subject, "accounts": ix.accounts_for_customer(db, customer)}
++
++
++def _period(request: Request, start: datetime, end: datetime) -> ix.Period:
++    s = _settings(request)
++    return ix.validate_period(start, end, now=utcnow(), settle_seconds=s.integration_settle_seconds,
++                              max_days=s.integration_max_period_days)
++
++
++@router.get("/accounts/{account_id}/statement-manifest")
++def statement_manifest(
++    account_id: int,
++    request: Request,
++    subject: str = Query(min_length=1, max_length=64),
++    period_start: datetime = Query(),
++    period_end: datetime = Query(),
++    client: Client = Depends(require_scope("statements:extract", "summaries:read")),
++    db: Session = Depends(get_db),
++):
++    period = _period(request, period_start, period_end)
++    with _ExportSlot(request.app.state.integration):
++        ix.begin_snapshot(db)
++        _user, customer = ix.customer_for_subject(db, subject)
++        account = ix.owned_account(db, customer, account_id)
++        manifest = ix.statement_manifest(db, customer, account, period, now=utcnow())
++        db.rollback()  # end the read-only snapshot before writing the audit row
++    audit.record(db, "integration.statement_manifest", "success", request=request,
++                 details={"client_id": client.client_id, "account_id": account_id,
++                          "period_start": manifest["period_start"], "period_end": manifest["period_end"],
++                          "entry_count": manifest["entry_count"]})
++    db.commit()
++    INTEGRATION_REQUESTS.labels("statement_manifest", "ok").inc()
++    return manifest
++
++
++@router.get("/accounts/{account_id}/statement-entries")
++def statement_entries(
++    account_id: int,
++    request: Request,
++    subject: str = Query(min_length=1, max_length=64),
++    period_start: datetime = Query(),
++    period_end: datetime = Query(),
++    cursor: str | None = Query(default=None, max_length=200),
++    limit: int = Query(default=500, ge=1),
++    _c: Client = Depends(require_scope("statements:extract")),
++    db: Session = Depends(get_db),
++):
++    period = _period(request, period_start, period_end)
++    limit = min(limit, _settings(request).integration_max_page_size)
++    with _ExportSlot(request.app.state.integration):
++        ix.begin_snapshot(db)
++        _user, customer = ix.customer_for_subject(db, subject)
++        account = ix.owned_account(db, customer, account_id)
++        page = ix.statement_entries(db, account, period, cursor=cursor, limit=limit)
++        db.rollback()
++    INTEGRATION_REQUESTS.labels("statement_entries", "ok").inc()
++    return page
++
++
++@router.get("/discovery/statement-accounts")
++def discovery(
++    request: Request,
++    after_account_id: int = Query(default=0, ge=0),
++    limit: int = Query(default=100, ge=1),
++    include_load_test: bool = False,
++    client: Client = Depends(require_scope("accounts:discover")),
++    db: Session = Depends(get_db),
++):
++    limit = min(limit, _settings(request).integration_discovery_max_page_size)
++    page = ix.discover_statement_accounts(db, after_account_id=after_account_id, limit=limit,
++                                          include_load_test=include_load_test)
++    db.rollback()
++    audit.record(db, "integration.discovery", "success", request=request,
++                 details={"client_id": client.client_id, "after_account_id": after_account_id,
++                          "returned": len(page["items"])})
++    db.commit()
++    INTEGRATION_REQUESTS.labels("discovery", "ok").inc()
++    return page
++
++
++@router.api_route("/{rest:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"], include_in_schema=False)
++def not_found(rest: str):
++    raise IntegrationHTTPError(404, "not_found", "Not found.")
++
++
++def install_error_handlers(app: FastAPI) -> None:
++    @app.exception_handler(IntegrationHTTPError)
++    async def _h1(_request: Request, exc: IntegrationHTTPError):
++        return _error(exc.status_code, exc.code, exc.message, exc.headers)
++
++    @app.exception_handler(ix.IntegrationError)
++    async def _h2(request: Request, exc: ix.IntegrationError):
++        if exc.status_code >= 500:
++            log.error("integration error", extra={"code": exc.code, "path": request.url.path})
++        INTEGRATION_REQUESTS.labels("any", exc.code).inc()
++        return _error(exc.status_code, exc.code, exc.message)
+diff --git a/backend/app/config.py b/backend/app/config.py
+index 579ebd0..0cba981 100644
+--- a/backend/app/config.py
++++ b/backend/app/config.py
+@@ -93,6 +93,23 @@ class Settings(BaseSettings):
+     # core; calibrate per environment (see docs/SCALING_DEMO.md).
+     demo_workload_simulations: int = Field(default=3000, ge=10, le=20000)
+ 
++    # --- Extension integration API (additive, DISABLED by default) -------------------
++    # When disabled the /internal/v1 router is not registered at all, so existing
++    # behaviour is unchanged. Clients authenticate with scoped bearer credentials whose
++    # SHA-256 digests (never the raw tokens) are listed in a JSON file mounted from a
++    # Secret. Several digests per client allow overlap during rotation.
++    integration_enabled: bool = False
++    integration_clients_file: str | None = None
++    integration_max_concurrent_exports: int = Field(default=2, ge=1, le=16)
++    integration_export_queue_timeout_seconds: float = Field(default=2.0, ge=0, le=30)
++    integration_max_page_size: int = Field(default=1000, ge=10, le=5000)
++    integration_max_period_days: int = Field(default=400, ge=1, le=3660)
++    # A statement period may end no later than now - settle seconds. Postings take
++    # posted_at before acquiring the account row lock, so a row with posted_at just
++    # before "now" can still commit slightly later. See docs in integration_exports.
++    integration_settle_seconds: int = Field(default=300, ge=0, le=86400)
++    integration_discovery_max_page_size: int = Field(default=500, ge=1, le=5000)
++
+     # --- Static frontend -----------------------------------------------------------
+     static_dir: str | None = None
+ 
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 4f4fa50..b780e02 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -128,6 +128,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
+         app.include_router(module.router)
+     if settings.demo_workload_enabled:
+         app.include_router(demo.router)
++    if settings.integration_enabled:
++        # Imported lazily so a disabled deployment never loads the integration code.
++        from app.api import integration
++
++        integration.configure(app, settings)
++        app.include_router(integration.router)
+ 
+     @app.get("/api/info", tags=["meta"])
+     def info():
+diff --git a/backend/app/services/integration_exports.py b/backend/app/services/integration_exports.py
+new file mode 100644
+index 0000000..1800d87
+--- /dev/null
++++ b/backend/app/services/integration_exports.py
+@@ -0,0 +1,288 @@
++"""Read-only data extraction for the extension integration API.
++
++Nothing in this module changes balances, ledger rows or ownership rules. It only
++reads, and it never returns full account numbers.
++
++Subjects
++--------
++``users.id`` is immutable, but a demo reset (TRUNCATE ... RESTART IDENTITY) reuses
++ids. The subject therefore binds the id to the user's creation instant:
++``nvb-user:<id>:<created_at unix seconds>``. A subject that no longer matches the
++current row is rejected. A reset that recreates a user with the same id and the
++same created_at second is still indistinguishable, so a core reset must be paired
++with an extension data reset (documented in the extension runbook).
++
++Statement dataset contract (version ``statement-v1``)
++---------------------------------------------------
++* Period boundaries are UTC instants, half-open: ``start <= posted_at < end``.
++  This is exactly what the existing /api/transactions date filters do (UTC days).
++  Callers convert local calendar periods (e.g. Africa/Cairo) to UTC instants.
++* Ordering is ``posted_at ASC, id ASC`` - deterministic for tied timestamps.
++* opening = sum of signed amounts with posted_at < start (accounts start at 0 and
++  every balance change writes a ledger entry; this is verified, see below).
++  closing = opening + credits - debits within the period. The current balance is
++  never substituted for a historical closing balance.
++* The manifest is computed in one REPEATABLE READ, READ ONLY snapshot on PostgreSQL
++  and includes a reconciliation check: sum(all signed entries) == accounts.balance.
++* Entries are fetched with keyset pagination (no offsets) and no row cap.
++* Consistency: postings take ``posted_at = now()`` *before* waiting for the account
++  row lock, so a transaction can commit a row whose posted_at is slightly in the
++  past. A maximum id or timestamp alone is therefore not a completeness guarantee.
++  We only serve periods with ``end <= now - settle_seconds`` (default 300 s; the
++  core's statement_timeout is 10 s), and the caller must verify that the entries
++  it received reproduce the manifest's count/totals and that the manifest's
++  ``dataset_id`` is unchanged after paging. Any mismatch means "retry later".
++"""
++
++from __future__ import annotations
++
++import base64
++import hashlib
++import json
++from dataclasses import dataclass
++from datetime import UTC, datetime, timedelta
++
++from sqlalchemy import and_, case, func, or_, select
++from sqlalchemy.orm import Session
++
++from app.db import as_utc
++from app.models import ROLE_CUSTOMER, Account, Customer, LedgerEntry, User
++from app.money import mask_account_number
++
++DATASET_VERSION = "statement-v1"
++SUBJECT_PREFIX = "nvb-user"
++
++
++class IntegrationError(Exception):
++    def __init__(self, status_code: int, code: str, message: str) -> None:
++        super().__init__(message)
++        self.status_code = status_code
++        self.code = code
++        self.message = message
++
++
++# --- Subjects -------------------------------------------------------------------------
++
++
++def subject_for(user: User) -> str:
++    return f"{SUBJECT_PREFIX}:{user.id}:{int(as_utc(user.created_at).timestamp())}"
++
++
++def _parse_subject(subject: str) -> tuple[int, int]:
++    parts = subject.split(":")
++    if len(parts) != 3 or parts[0] != SUBJECT_PREFIX or not parts[1].isdigit() or not parts[2].isdigit():
++        raise IntegrationError(422, "invalid_subject", "Subject is not valid.")
++    return int(parts[1]), int(parts[2])
++
++
++def customer_for_subject(db: Session, subject: str) -> tuple[User, Customer]:
++    """Return the active customer behind a subject, or fail closed with 404."""
++    user_id, created = _parse_subject(subject)
++    user = db.get(User, user_id)
++    if user is None or int(as_utc(user.created_at).timestamp()) != created:
++        raise IntegrationError(404, "subject_not_found", "Subject not found.")
++    if not user.is_active or user.role != ROLE_CUSTOMER or user.customer is None:
++        # Suspended users and non-customers are not eligible for customer data.
++        raise IntegrationError(404, "subject_not_found", "Subject not found.")
++    return user, user.customer
++
++
++def owned_account(db: Session, customer: Customer, account_id: int) -> Account:
++    acct = db.scalar(select(Account).where(Account.id == account_id, Account.customer_id == customer.id))
++    if acct is None:
++        raise IntegrationError(404, "account_not_found", "Account not found.")
++    return acct
++
++
++def account_summary(a: Account) -> dict:
++    return {
++        "account_id": a.id,
++        "masked_number": mask_account_number(a.account_number),
++        "type": a.account_type,
++        "nickname": a.nickname,
++        "currency": a.currency,
++        "status": a.status,
++        "opened_at": as_utc(a.opened_at).isoformat(),
++    }
++
++
++def accounts_for_customer(db: Session, customer: Customer) -> list[dict]:
++    rows = db.scalars(select(Account).where(Account.customer_id == customer.id).order_by(Account.id)).all()
++    return [account_summary(a) for a in rows]
++
++
++# --- Periods --------------------------------------------------------------------------
++
++
++@dataclass(frozen=True)
++class Period:
++    start: datetime
++    end: datetime
++
++
++def validate_period(start: datetime, end: datetime, *, now: datetime, settle_seconds: int,
++                    max_days: int) -> Period:
++    if start.tzinfo is None or end.tzinfo is None:
++        raise IntegrationError(422, "naive_datetime", "Period boundaries must include a UTC offset.")
++    start, end = start.astimezone(UTC), end.astimezone(UTC)
++    if start >= end:
++        raise IntegrationError(422, "invalid_period", "period_start must be before period_end.")
++    if end - start > timedelta(days=max_days):
++        raise IntegrationError(422, "period_too_long", f"Period must be at most {max_days} days.")
++    if end > now - timedelta(seconds=settle_seconds):
++        raise IntegrationError(409, "period_not_settled",
++                               "Period end is too recent to guarantee a complete dataset; retry later.")
++    return Period(start, end)
++
++
++# --- Snapshot helper ------------------------------------------------------------------
++
++
++def begin_snapshot(db: Session) -> None:
++    """Start a REPEATABLE READ READ ONLY transaction on PostgreSQL.
++
++    SQLite (tests only) already serialises transactions with BEGIN IMMEDIATE.
++    Must be called before the session has started a transaction.
++    """
++    if db.get_bind().dialect.name == "postgresql":
++        db.connection(execution_options={"isolation_level": "REPEATABLE READ", "postgresql_readonly": True})
++
++
++# --- Statement manifest and entries -----------------------------------------------------
++
++
++def _signed():
++    return case((LedgerEntry.direction == "credit", LedgerEntry.amount_minor), else_=-LedgerEntry.amount_minor)
++
++
++def statement_manifest(db: Session, customer: Customer, account: Account, period: Period,
++                       *, now: datetime) -> dict:
++    acct_filter = LedgerEntry.account_id == account.id
++    in_period = and_(acct_filter, LedgerEntry.posted_at >= period.start, LedgerEntry.posted_at < period.end)
++
++    opening = db.scalar(
++        select(func.coalesce(func.sum(_signed()), 0)).where(acct_filter, LedgerEntry.posted_at < period.start)
++    )
++    credit_total, debit_total, count, first_id, last_id = db.execute(
++        select(
++            func.coalesce(func.sum(case((LedgerEntry.direction == "credit", LedgerEntry.amount_minor), else_=0)), 0),
++            func.coalesce(func.sum(case((LedgerEntry.direction == "debit", LedgerEntry.amount_minor), else_=0)), 0),
++            func.count(LedgerEntry.id),
++            func.min(LedgerEntry.id),
++            func.max(LedgerEntry.id),
++        ).where(in_period)
++    ).one()
++    ledger_total = db.scalar(select(func.coalesce(func.sum(_signed()), 0)).where(acct_filter))
++    balance_now = db.scalar(select(Account.balance_minor).where(Account.id == account.id))
++    if int(ledger_total) != int(balance_now):
++        raise IntegrationError(500, "ledger_reconciliation_failed",
++                               "Ledger does not reconcile with the account balance.")
++
++    opening, credit_total, debit_total = int(opening), int(credit_total), int(debit_total)
++    closing = opening + credit_total - debit_total
++    opened_at = as_utc(account.opened_at)
++    core = {
++        "dataset_version": DATASET_VERSION,
++        "account_id": account.id,
++        "period_start": period.start.isoformat(),
++        "period_end": period.end.isoformat(),
++        "opening_balance_minor": opening,
++        "closing_balance_minor": closing,
++        "credit_total_minor": credit_total,
++        "debit_total_minor": debit_total,
++        "entry_count": int(count),
++        "first_entry_id": first_id,
++        "last_entry_id": last_id,
++    }
++    dataset_id = hashlib.sha256(json.dumps(core, sort_keys=True).encode()).hexdigest()
++    holder = customer.full_name if isinstance(customer, Customer) else None
++    return {
++        **core,
++        "dataset_id": dataset_id,
++        "boundary": "[start,end) UTC",
++        "ordering": "posted_at ASC, id ASC",
++        "currency": account.currency,
++        "account": {**account_summary(account), "holder_name": holder},
++        "account_opened_in_period": period.start <= opened_at < period.end,
++        "account_opened_after_period": opened_at >= period.end,
++        "generated_at": now.isoformat(),
++    }
++
++
++def encode_cursor(posted_at: datetime, entry_id: int) -> str:
++    raw = f"{as_utc(posted_at).isoformat()}|{entry_id}"
++    return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
++
++
++def decode_cursor(cursor: str) -> tuple[datetime, int]:
++    try:
++        padded = cursor + "=" * (-len(cursor) % 4)
++        posted, entry_id = base64.urlsafe_b64decode(padded.encode()).decode().split("|")
++        dt = datetime.fromisoformat(posted)
++        if dt.tzinfo is None:
++            raise ValueError
++        return dt.astimezone(UTC), int(entry_id)
++    except (ValueError, UnicodeDecodeError):
++        raise IntegrationError(422, "invalid_cursor", "Cursor is not valid.") from None
++
++
++def entry_out(e: LedgerEntry) -> dict:
++    return {
++        "entry_id": e.id,
++        "posted_at": as_utc(e.posted_at).isoformat(),
++        "reference": e.reference,
++        "direction": e.direction,
++        "type": e.txn_type,
++        "category": e.category,
++        "amount_minor": e.amount_minor,
++        "signed_amount_minor": e.amount_minor if e.direction == "credit" else -e.amount_minor,
++        "balance_after_minor": e.balance_after_minor,
++        "description": e.description,
++        "counterparty": e.counterparty,
++    }
++
++
++def statement_entries(db: Session, account: Account, period: Period, *, cursor: str | None,
++                      limit: int) -> dict:
++    stmt = select(LedgerEntry).where(
++        LedgerEntry.account_id == account.id,
++        LedgerEntry.posted_at >= period.start,
++        LedgerEntry.posted_at < period.end,
++    )
++    if cursor:
++        after_posted, after_id = decode_cursor(cursor)
++        stmt = stmt.where(or_(LedgerEntry.posted_at > after_posted,
++                              and_(LedgerEntry.posted_at == after_posted, LedgerEntry.id > after_id)))
++    rows = db.scalars(stmt.order_by(LedgerEntry.posted_at.asc(), LedgerEntry.id.asc()).limit(limit + 1)).all()
++    has_more = len(rows) > limit
++    rows = rows[:limit]
++    return {
++        "items": [entry_out(e) for e in rows],
++        "has_more": has_more,
++        "next_cursor": encode_cursor(rows[-1].posted_at, rows[-1].id) if has_more else None,
++    }
++
++
++# --- Batch discovery ------------------------------------------------------------------
++
++
++def discover_statement_accounts(db: Session, *, after_account_id: int, limit: int,
++                                include_load_test: bool) -> dict:
++    """Active accounts of active customers, keyset-paginated by account id."""
++    stmt = (
++        select(Account, User)
++        .join(Customer, Customer.id == Account.customer_id)
++        .join(User, User.id == Customer.user_id)
++        .where(Account.id > after_account_id, Account.status == "active", User.is_active.is_(True),
++               User.role == ROLE_CUSTOMER)
++    )
++    if not include_load_test:
++        stmt = stmt.where(User.is_load_test.is_(False))
++    rows = db.execute(stmt.order_by(Account.id).limit(limit + 1)).all()
++    has_more = len(rows) > limit
++    rows = rows[:limit]
++    return {
++        "items": [{"subject": subject_for(u), **account_summary(a)} for a, u in rows],
++        "has_more": has_more,
++        "next_after_account_id": rows[-1][0].id if has_more else None,
++    }
+diff --git a/backend/tests/integration_support.py b/backend/tests/integration_support.py
+new file mode 100644
+index 0000000..46bdc61
+--- /dev/null
++++ b/backend/tests/integration_support.py
+@@ -0,0 +1,48 @@
++"""Helpers for the extension integration API tests (test-only credentials)."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import secrets
++from pathlib import Path
++
++from sqlalchemy import select
++
++from app.models import Account, Customer, User
++
++ALL_SCOPES = ["identity:introspect", "accounts:read", "statements:extract", "summaries:read", "accounts:discover"]
++
++
++def digest(token: str) -> str:
++    return hashlib.sha256(token.encode()).hexdigest()
++
++
++def write_clients(path: Path, clients: dict[str, tuple[list[str], list[str]]]) -> None:
++    """clients: client_id -> (tokens, scopes)."""
++    payload = {"clients": [{"client_id": cid, "token_sha256": [digest(t) for t in tokens], "scopes": scopes}
++                           for cid, (tokens, scopes) in clients.items()]}
++    path.write_text(json.dumps(payload), encoding="utf-8")
++
++
++def new_token() -> str:
++    return secrets.token_urlsafe(32)
++
++
++def bearer(token: str) -> dict:
++    return {"Authorization": f"Bearer {token}"}
++
++
++def user_row(app, username: str) -> User:
++    db = app.state.sessionmaker()
++    user = db.scalar(select(User).where(User.username == username))
++    db.close()
++    return user
++
++
++def first_account_id(app, username: str) -> int:
++    db = app.state.sessionmaker()
++    acct_id = db.scalar(select(Account.id).join(Customer).join(User).where(User.username == username)
++                        .order_by(Account.id))
++    db.close()
++    return acct_id
+diff --git a/backend/tests/test_health.py b/backend/tests/test_health.py
+index 45bf669..5e6db65 100644
+--- a/backend/tests/test_health.py
++++ b/backend/tests/test_health.py
+@@ -44,7 +44,10 @@ def test_metrics_labels_use_route_templates_not_ids(customer_client):
+     customer_client.get("/api/accounts/999999")
+     r = customer_client.get("/metrics", headers={"Authorization": "Bearer test-metrics-token"})
+     assert 'route="/api/accounts/{account_id}"' in r.text
+-    assert "999999" not in r.text
++    # Check label values only: float sample values (e.g. duration sums) may contain "999999".
++    labels = [line[line.index("{"):line.index("}") + 1] for line in r.text.splitlines()
++              if not line.startswith("#") and "{" in line]
++    assert labels and not any("999999" in lbl for lbl in labels)
+ 
+ 
+ def test_request_id_and_instance_headers(client):
+diff --git a/backend/tests/test_integration_auth.py b/backend/tests/test_integration_auth.py
+new file mode 100644
+index 0000000..ebcc033
+--- /dev/null
++++ b/backend/tests/test_integration_auth.py
+@@ -0,0 +1,232 @@
++"""Integration API authentication, scopes, session introspection and the disabled default."""
++
++from datetime import timedelta
++
++import pytest
++from fastapi.testclient import TestClient
++from sqlalchemy import update
++
++from app.api import integration as integration_api
++from app.db import utcnow
++from app.main import create_app
++from app.models import User, UserSession
++from app.services.integration_exports import subject_for
++from tests.conftest import login, make_settings
++from tests.integration_support import ALL_SCOPES, bearer, new_token, user_row, write_clients
++
++TOKEN = new_token()
++LIMITED = new_token()
++
++
++@pytest.fixture
++def clients_file(tmp_path):
++    path = tmp_path / "integration-clients.json"
++    write_clients(path, {"adapter": ([TOKEN], ALL_SCOPES), "limited": ([LIMITED], ["identity:introspect"])})
++    return path
++
++
++@pytest.fixture
++def settings(db_url, clients_file):
++    return make_settings(db_url, integration_enabled=True, integration_clients_file=str(clients_file),
++                         integration_settle_seconds=0)
++
++
++@pytest.fixture(autouse=True)
++def fast_reload(monkeypatch):
++    monkeypatch.setattr(integration_api, "RELOAD_CHECK_SECONDS", 0)
++
++
++def _session(app, username="customer001"):
++    c = TestClient(app)
++    body = login(c, username)
++    return c, c.cookies.get("nvb_session"), body["csrf_token"]
++
++
++def _introspect(client, token, session_token, **extra):
++    return client.post("/internal/v1/sessions/introspect", headers=bearer(token),
++                       json={"session_token": session_token, **extra})
++
++
++# --- Disabled by default -----------------------------------------------------------------
++
++
++def test_integration_disabled_by_default_registers_nothing(db_url, clients_file):
++    from app.db import Base
++    from app.services.seed import seed_database
++    from tests.conftest import PASSWORDS
++
++    settings = make_settings(db_url)  # integration_enabled defaults to False
++    assert settings.integration_enabled is False
++    app = create_app(settings)
++    Base.metadata.create_all(app.state.engine)
++    db = app.state.sessionmaker()
++    seed_database(db, app.state.passwords, PASSWORDS, customer_count=2, loadtest_count=0, demo_count=0)
++    db.close()
++    c = TestClient(app)
++    assert not any(getattr(r, "path", "").startswith("/internal") for r in app.routes)
++    resp = c.post("/internal/v1/sessions/introspect", headers=bearer(TOKEN), json={"session_token": "x"})
++    assert resp.status_code in (404, 405)
++    # Existing behaviour preserved
++    login(c, "customer001")
++    assert c.get("/api/accounts").status_code == 200
++    app.state.engine.dispose()
++
++
++# --- Client authentication -----------------------------------------------------------
++
++
++@pytest.mark.parametrize("headers", [{}, {"Authorization": "Bearer "}, {"Authorization": "Basic abc"},
++                                     {"Authorization": "Bearer short"}, bearer(new_token())])
++def test_invalid_client_credentials_fail_closed(client, headers):
++    resp = client.post("/internal/v1/sessions/introspect", headers=headers, json={"session_token": "abc"})
++    assert resp.status_code == 401
++    assert resp.json()["error"]["code"] == "invalid_client"
++    assert resp.headers["WWW-Authenticate"] == "Bearer"
++
++
++def test_missing_scope_is_forbidden(client):
++    resp = client.get("/internal/v1/discovery/statement-accounts", headers=bearer(LIMITED))
++    assert resp.status_code == 403
++    assert resp.json()["error"]["code"] == "insufficient_scope"
++
++
++def test_no_clients_file_fails_closed(db_url, app):
++    other = create_app(make_settings(db_url, integration_enabled=True, integration_clients_file=None))
++    resp = TestClient(other).post("/internal/v1/sessions/introspect", headers=bearer(TOKEN),
++                                  json={"session_token": "abc"})
++    assert resp.status_code == 401
++
++
++def test_corrupt_clients_file_fails_closed(db_url, app, tmp_path):
++    bad = tmp_path / "bad.json"
++    bad.write_text("{not json", encoding="utf-8")
++    other = create_app(make_settings(db_url, integration_enabled=True, integration_clients_file=str(bad)))
++    resp = TestClient(other).post("/internal/v1/sessions/introspect", headers=bearer(TOKEN),
++                                  json={"session_token": "abc"})
++    assert resp.status_code == 401
++
++
++def test_unknown_scope_in_file_fails_closed(db_url, app, tmp_path):
++    path = tmp_path / "scopes.json"
++    write_clients(path, {"adapter": ([TOKEN], ["identity:introspect", "admin:everything"])})
++    other = create_app(make_settings(db_url, integration_enabled=True, integration_clients_file=str(path)))
++    resp = TestClient(other).post("/internal/v1/sessions/introspect", headers=bearer(TOKEN),
++                                  json={"session_token": "abc"})
++    assert resp.status_code == 401
++
++
++def test_credential_rotation_without_restart(client, clients_file):
++    import os
++    import time
++
++    rotated = new_token()
++    write_clients(clients_file, {"adapter": ([TOKEN, rotated], ALL_SCOPES)})
++    st = os.stat(clients_file)
++    os.utime(clients_file, (st.st_atime, st.st_mtime + 5))
++    assert _introspect(client, rotated, "abc").status_code == 200
++    assert _introspect(client, TOKEN, "abc").status_code == 200  # overlap period
++    write_clients(clients_file, {"adapter": ([rotated], ALL_SCOPES)})
++    os.utime(clients_file, (time.time() + 20, time.time() + 20))
++    assert _introspect(client, TOKEN, "abc").status_code == 401
++    assert _introspect(client, rotated, "abc").status_code == 200
++
++
++def test_client_token_does_not_grant_customer_api_access(client):
++    assert client.get("/api/accounts", headers=bearer(TOKEN)).status_code == 401
++
++
++def test_unknown_internal_path_is_404(client):
++    assert client.get("/internal/v1/nope", headers=bearer(TOKEN)).status_code == 404
++
++
++# --- Session introspection -------------------------------------------------------------
++
++
++def test_introspect_active_session_returns_stable_subject(app, client):
++    _c, cookie, _csrf = _session(app)
++    body = _introspect(client, TOKEN, cookie).json()
++    user = user_row(app, "customer001")
++    assert body["active"] is True
++    assert body["subject"] == subject_for(user)
++    assert body["role"] == "customer"
++    assert body["customer_number"]
++    assert body["csrf_valid"] is None
++    assert "csrf_token" not in body  # the CSRF secret is never disclosed to services
++    assert "accounts" not in body
++
++
++def test_introspect_unknown_token_inactive(client):
++    assert _introspect(client, TOKEN, "not-a-real-session-token").json() == {"active": False}
++
++
++def test_introspect_checks_csrf(app, client):
++    _c, cookie, csrf = _session(app)
++    assert _introspect(client, TOKEN, cookie, csrf_token=csrf).json()["csrf_valid"] is True
++    assert _introspect(client, TOKEN, cookie, csrf_token="forged").json()["csrf_valid"] is False
++    assert _introspect(client, TOKEN, cookie, csrf_token="").json()["csrf_valid"] is False
++
++
++def test_csrf_of_another_session_is_invalid(app, client):
++    _c1, cookie1, _ = _session(app, "customer001")
++    _c2, _cookie2, csrf2 = _session(app, "customer002")
++    assert _introspect(client, TOKEN, cookie1, csrf_token=csrf2).json()["csrf_valid"] is False
++
++
++def test_introspect_after_logout_is_inactive(app, client):
++    c, cookie, _ = _session(app)
++    assert c.post("/api/auth/logout").status_code == 200
++    assert _introspect(client, TOKEN, cookie).json() == {"active": False}
++
++
++@pytest.mark.parametrize("column", ["expires_at", "absolute_expires_at"])
++def test_introspect_expired_session_is_inactive(app, client, column):
++    _c, cookie, _ = _session(app)
++    db = app.state.sessionmaker()
++    db.execute(update(UserSession).values({column: utcnow() - timedelta(seconds=1)}))
++    db.commit()
++    db.close()
++    assert _introspect(client, TOKEN, cookie).json() == {"active": False}
++
++
++def test_introspect_suspended_user_is_inactive(app, client):
++    _c, cookie, _ = _session(app)
++    db = app.state.sessionmaker()
++    db.execute(update(User).where(User.username == "customer001").values(is_active=False))
++    db.commit()
++    db.close()
++    assert _introspect(client, TOKEN, cookie).json() == {"active": False}
++
++
++def test_forged_identity_headers_are_ignored(app, client):
++    _c, cookie, _ = _session(app, "customer001")
++    resp = client.post("/internal/v1/sessions/introspect",
++                       headers={**bearer(TOKEN), "X-User": "opsadmin", "X-Role": "admin",
++                                "X-Customer-Number": "C000002", "X-Subject": "nvb-user:1:1"},
++                       json={"session_token": cookie})
++    body = resp.json()
++    assert body["subject"] == subject_for(user_row(app, "customer001"))
++    assert body["role"] == "customer"
++
++
++def test_include_accounts_lists_only_own_accounts(app, client):
++    _c, cookie, _ = _session(app, "customer001")
++    body = _introspect(client, TOKEN, cookie, include_accounts=True).json()
++    own = {a["id"] for a in _c.get("/api/accounts").json()["accounts"]}
++    assert {a["account_id"] for a in body["accounts"]} == own
++    for a in body["accounts"]:
++        assert a["masked_number"].startswith("•••• ")
++        assert "account_number" not in a
++
++
++def test_include_accounts_requires_accounts_scope(app, client):
++    _c, cookie, _ = _session(app)
++    resp = _introspect(client, LIMITED, cookie, include_accounts=True)
++    assert resp.status_code == 403
++
++
++def test_admin_session_is_not_a_customer(app, client):
++    _c, cookie, _ = _session(app, "opsadmin")
++    body = _introspect(client, TOKEN, cookie, include_accounts=True).json()
++    assert body["role"] == "admin"
++    assert body["accounts"] == []
++    assert body["customer_number"] is None
+diff --git a/backend/tests/test_integration_exports.py b/backend/tests/test_integration_exports.py
+new file mode 100644
+index 0000000..50b5805
+--- /dev/null
++++ b/backend/tests/test_integration_exports.py
+@@ -0,0 +1,393 @@
++"""Statement dataset contract: correctness, isolation, completeness and core protection."""
++
++from datetime import UTC, datetime, timedelta
++
++import pytest
++from fastapi.testclient import TestClient
++from sqlalchemy import func, insert, select, update
++
++from app.db import utcnow
++from app.models import Account, AuditEvent, Customer, LedgerEntry, User
++from app.services.integration_exports import subject_for
++from tests.conftest import idem, login, make_settings
++from tests.integration_support import ALL_SCOPES, bearer, first_account_id, new_token, user_row, write_clients
++
++TOKEN = new_token()
++SUMMARY = new_token()
++DISCOVER_ONLY = new_token()
++
++
++@pytest.fixture
++def settings(db_url, tmp_path):
++    path = tmp_path / "integration-clients.json"
++    write_clients(path, {
++        "adapter": ([TOKEN], ALL_SCOPES),
++        "loans": ([SUMMARY], ["summaries:read"]),
++        "discover": ([DISCOVER_ONLY], ["accounts:discover"]),
++    })
++    return make_settings(db_url, integration_enabled=True, integration_clients_file=str(path),
++                         integration_settle_seconds=0, integration_max_concurrent_exports=1,
++                         integration_export_queue_timeout_seconds=0)
++
++
++def iso(dt: datetime) -> str:
++    return dt.astimezone(UTC).isoformat()
++
++
++def ctx(app, username="customer001"):
++    return subject_for(user_row(app, username)), first_account_id(app, username)
++
++
++def manifest(client, subject, account_id, start, end, token=TOKEN):
++    return client.get(f"/internal/v1/accounts/{account_id}/statement-manifest", headers=bearer(token),
++                      params={"subject": subject, "period_start": iso(start), "period_end": iso(end)})
++
++
++def all_entries(client, subject, account_id, start, end, limit=50):
++    items, cursor, pages = [], None, 0
++    while True:
++        params = {"subject": subject, "period_start": iso(start), "period_end": iso(end), "limit": limit}
++        if cursor:
++            params["cursor"] = cursor
++        resp = client.get(f"/internal/v1/accounts/{account_id}/statement-entries", headers=bearer(TOKEN),
++                          params=params)
++        assert resp.status_code == 200, resp.text
++        body = resp.json()
++        items += body["items"]
++        pages += 1
++        if not body["has_more"]:
++            return items, pages
++        cursor = body["next_cursor"]
++
++
++def db_signed_sum(app, account_id, before=None, start=None, end=None):
++    db = app.state.sessionmaker()
++    rows = db.scalars(select(LedgerEntry).where(LedgerEntry.account_id == account_id)).all()
++    db.close()
++    from app.db import as_utc
++    total = 0
++    for e in rows:
++        p = as_utc(e.posted_at)
++        if before is not None and not p < before:
++            continue
++        if start is not None and not (start <= p < end):
++            continue
++        total += e.amount_minor if e.direction == "credit" else -e.amount_minor
++    return total
++
++
++NOW = None
++
++
++def window():
++    end = utcnow().replace(microsecond=0) - timedelta(minutes=1)
++    return end - timedelta(days=60), end
++
++
++# --- Correctness -------------------------------------------------------------------------
++
++
++def test_opening_and_closing_balances_match_ledger(app, client):
++    subject, acct = ctx(app)
++    start, end = window()
++    body = manifest(client, subject, acct, start, end).json()
++    assert body["opening_balance_minor"] == db_signed_sum(app, acct, before=start)
++    assert body["closing_balance_minor"] == body["opening_balance_minor"] + db_signed_sum(app, acct, start=start, end=end)
++    assert body["closing_balance_minor"] == (body["opening_balance_minor"] + body["credit_total_minor"]
++                                             - body["debit_total_minor"])
++    assert body["boundary"] == "[start,end) UTC"
++    assert body["account"]["masked_number"].startswith("•••• ")
++    assert "account_number" not in body["account"]
++    assert body["account"]["holder_name"]
++
++
++def test_closing_is_historical_not_current_balance(app, client, customer_client):
++    subject, acct = ctx(app)
++    start, end = window()
++    before = manifest(client, subject, acct, start, end).json()
++    resp = customer_client.post(f"/api/accounts/{acct}/deposit", headers={"Idempotency-Key": idem()},
++                                json={"amount": "123.45", "description": "after period"})
++    assert resp.status_code == 201, resp.text
++    after = manifest(client, subject, acct, start, end).json()
++    assert after["closing_balance_minor"] == before["closing_balance_minor"]
++    assert after["dataset_id"] == before["dataset_id"]
++
++
++def test_consecutive_periods_chain(app, client):
++    subject, acct = ctx(app)
++    start, end = window()
++    mid = start + timedelta(days=17, hours=5)
++    a = manifest(client, subject, acct, start, mid).json()
++    b = manifest(client, subject, acct, mid, end).json()
++    whole = manifest(client, subject, acct, start, end).json()
++    assert a["closing_balance_minor"] == b["opening_balance_minor"]
++    assert a["entry_count"] + b["entry_count"] == whole["entry_count"]
++    assert b["closing_balance_minor"] == whole["closing_balance_minor"]
++
++
++def test_empty_period_before_account_opened(app, client):
++    subject, acct = ctx(app)
++    start = datetime(2001, 1, 1, tzinfo=UTC)
++    body = manifest(client, subject, acct, start, start + timedelta(days=31)).json()
++    assert body["entry_count"] == 0
++    assert body["opening_balance_minor"] == body["closing_balance_minor"] == 0
++    assert body["account_opened_after_period"] is True
++
++
++def test_account_opened_during_period(app, client):
++    subject, acct = ctx(app)
++    db = app.state.sessionmaker()
++    opened = db.scalar(select(Account.opened_at).where(Account.id == acct))
++    db.close()
++    from app.db import as_utc
++    opened = as_utc(opened)
++    body = manifest(client, subject, acct, opened - timedelta(days=5), opened + timedelta(days=5)).json()
++    assert body["account_opened_in_period"] is True
++    assert body["opening_balance_minor"] == 0
++
++
++def test_entries_reproduce_manifest_with_stable_order(app, client):
++    subject, acct = ctx(app)
++    start, end = window()
++    m = manifest(client, subject, acct, start, end).json()
++    items, pages = all_entries(client, subject, acct, start, end, limit=7)
++    assert pages > 1
++    assert len(items) == m["entry_count"]
++    assert len({i["entry_id"] for i in items}) == len(items)
++    keys = [(i["posted_at"], i["entry_id"]) for i in items]
++    assert keys == sorted(keys)
++    credits = sum(i["amount_minor"] for i in items if i["direction"] == "credit")
++    debits = sum(i["amount_minor"] for i in items if i["direction"] == "debit")
++    assert (credits, debits) == (m["credit_total_minor"], m["debit_total_minor"])
++    assert all(isinstance(i["amount_minor"], int) for i in items)
++
++
++def test_period_boundaries_are_half_open_utc(app, client):
++    subject, acct = ctx(app)
++    t = datetime(2020, 6, 30, 21, 0, 0, tzinfo=UTC)  # 2020-07-01 00:00 Africa/Cairo (UTC+3 in summer)
++    db = app.state.sessionmaker()
++    db.execute(insert(LedgerEntry), [
++        dict(account_id=acct, reference="BOUNDARY1", direction="credit", txn_type="deposit", category="Test",
++             amount_minor=100, balance_after_minor=0, description="at start", counterparty="", posted_at=t),
++        dict(account_id=acct, reference="BOUNDARY2", direction="credit", txn_type="deposit", category="Test",
++             amount_minor=200, balance_after_minor=0, description="just before end", counterparty="",
++             posted_at=t + timedelta(days=1) - timedelta(microseconds=1)),
++        dict(account_id=acct, reference="BOUNDARY3", direction="credit", txn_type="deposit", category="Test",
++             amount_minor=400, balance_after_minor=0, description="at end", counterparty="",
++             posted_at=t + timedelta(days=1)),
++    ])
++    db.execute(update(Account).where(Account.id == acct).values(balance_minor=Account.balance_minor + 700))
++    db.commit()
++    db.close()
++    body = manifest(client, subject, acct, t, t + timedelta(days=1)).json()
++    assert body["entry_count"] == 2
++    assert body["credit_total_minor"] == 300
++    items, _ = all_entries(client, subject, acct, t, t + timedelta(days=1))
++    assert [i["reference"] for i in items] == ["BOUNDARY1", "BOUNDARY2"]
++
++
++def test_tied_timestamps_order_by_id(app, client):
++    subject, acct = ctx(app)
++    t = datetime(2019, 3, 1, 12, 0, tzinfo=UTC)
++    db = app.state.sessionmaker()
++    db.execute(insert(LedgerEntry), [
++        dict(account_id=acct, reference=f"TIE{n}", direction="credit", txn_type="deposit", category="Test",
++             amount_minor=10 + n, balance_after_minor=0, description="tie", counterparty="", posted_at=t)
++        for n in range(5)
++    ])
++    db.execute(update(Account).where(Account.id == acct).values(balance_minor=Account.balance_minor + 60))
++    db.commit()
++    db.close()
++    items, _ = all_entries(client, subject, acct, t, t + timedelta(seconds=1), limit=2)
++    assert [i["reference"] for i in items] == [f"TIE{n}" for n in range(5)]
++    ids = [i["entry_id"] for i in items]
++    assert ids == sorted(ids)
++
++
++def test_more_than_ten_thousand_entries_without_truncation(app, client):
++    subject, acct = ctx(app)
++    t0 = datetime(2018, 1, 1, tzinfo=UTC)
++    n = 10_050
++    rows = [dict(account_id=acct, reference=f"BULK{i:06d}", direction="credit", txn_type="deposit",
++                 category="Test", amount_minor=1, balance_after_minor=0, description="bulk", counterparty="",
++                 posted_at=t0 + timedelta(seconds=i // 3)) for i in range(n)]
++    db = app.state.sessionmaker()
++    for i in range(0, n, 2000):
++        db.execute(insert(LedgerEntry), rows[i:i + 2000])
++    db.execute(update(Account).where(Account.id == acct).values(balance_minor=Account.balance_minor + n))
++    db.commit()
++    db.close()
++    end = t0 + timedelta(days=1)
++    m = manifest(client, subject, acct, t0, end).json()
++    assert m["entry_count"] == n
++    items, pages = all_entries(client, subject, acct, t0, end, limit=1000)
++    assert len(items) == n and pages == 11
++    assert len({i["entry_id"] for i in items}) == n
++
++
++def test_concurrent_posting_between_pages_does_not_change_closed_period(app, client, customer_client):
++    subject, acct = ctx(app)
++    start, end = window()
++    m1 = manifest(client, subject, acct, start, end).json()
++    first = client.get(f"/internal/v1/accounts/{acct}/statement-entries", headers=bearer(TOKEN),
++                       params={"subject": subject, "period_start": iso(start), "period_end": iso(end), "limit": 5}).json()
++    customer_client.post(f"/api/accounts/{acct}/deposit", headers={"Idempotency-Key": idem()},
++                         json={"amount": "10.00", "description": "concurrent"})
++    rest, _ = all_entries(client, subject, acct, start, end, limit=5)
++    m2 = manifest(client, subject, acct, start, end).json()
++    assert m1["dataset_id"] == m2["dataset_id"]
++    assert first["items"] == rest[:5]
++    assert len(rest) == m1["entry_count"]
++
++
++# --- Isolation -------------------------------------------------------------------------
++
++
++def test_other_customers_account_is_not_found(app, client):
++    subject, _ = ctx(app, "customer001")
++    _, other_acct = ctx(app, "customer002")
++    start, end = window()
++    resp = manifest(client, subject, other_acct, start, end)
++    assert resp.status_code == 404 and resp.json()["error"]["code"] == "account_not_found"
++    resp = client.get(f"/internal/v1/accounts/{other_acct}/statement-entries", headers=bearer(TOKEN),
++                      params={"subject": subject, "period_start": iso(start), "period_end": iso(end)})
++    assert resp.status_code == 404
++    assert manifest(client, subject, 999_999, start, end).status_code == 404
++
++
++def test_tampered_or_reused_subject_is_rejected(app, client):
++    user = user_row(app, "customer001")
++    _, acct = ctx(app)
++    start, end = window()
++    for bad in (f"nvb-user:{user.id}:1", "nvb-user:999999:1"):
++        assert manifest(client, bad, acct, start, end).status_code == 404
++    assert manifest(client, "customer001", acct, start, end).status_code == 422
++
++
++def test_suspended_subject_is_rejected(app, client):
++    subject, acct = ctx(app)
++    db = app.state.sessionmaker()
++    db.execute(update(User).where(User.username == "customer001").values(is_active=False))
++    db.commit()
++    db.close()
++    start, end = window()
++    assert manifest(client, subject, acct, start, end).status_code == 404
++
++
++def test_summary_scope_reads_manifest_but_not_entries(app, client):
++    subject, acct = ctx(app)
++    start, end = window()
++    assert manifest(client, subject, acct, start, end, token=SUMMARY).status_code == 200
++    resp = client.get(f"/internal/v1/accounts/{acct}/statement-entries", headers=bearer(SUMMARY),
++                      params={"subject": subject, "period_start": iso(start), "period_end": iso(end)})
++    assert resp.status_code == 403
++
++
++# --- Validation and core protection ------------------------------------------------------
++
++
++def test_period_not_settled_is_rejected(db_url, app, tmp_path):
++    path = tmp_path / "c.json"
++    write_clients(path, {"adapter": ([TOKEN], ALL_SCOPES)})
++    strict = TestClient(__import__("app.main", fromlist=["create_app"]).create_app(
++        make_settings(db_url, integration_enabled=True, integration_clients_file=str(path),
++                      integration_settle_seconds=300)))
++    subject, acct = ctx(app)
++    now = utcnow()
++    resp = manifest(strict, subject, acct, now - timedelta(days=3), now - timedelta(seconds=60))
++    assert resp.status_code == 409 and resp.json()["error"]["code"] == "period_not_settled"
++    assert manifest(strict, subject, acct, now - timedelta(days=3), now - timedelta(seconds=600)).status_code == 200
++
++
++def test_invalid_periods(app, client):
++    subject, acct = ctx(app)
++    start, end = window()
++    assert manifest(client, subject, acct, end, start).status_code == 422
++    assert manifest(client, subject, acct, end - timedelta(days=500), end).status_code == 422
++    resp = client.get(f"/internal/v1/accounts/{acct}/statement-manifest", headers=bearer(TOKEN),
++                      params={"subject": subject, "period_start": "2026-01-01T00:00:00",
++                              "period_end": "2026-02-01T00:00:00"})
++    assert resp.status_code == 422
++
++
++def test_invalid_cursor(app, client):
++    subject, acct = ctx(app)
++    start, end = window()
++    resp = client.get(f"/internal/v1/accounts/{acct}/statement-entries", headers=bearer(TOKEN),
++                      params={"subject": subject, "period_start": iso(start), "period_end": iso(end),
++                              "cursor": "@@not-a-cursor"})
++    assert resp.status_code == 422
++
++
++def test_page_size_is_capped(app, client):
++    subject, acct = ctx(app)
++    start, end = window()
++    body = client.get(f"/internal/v1/accounts/{acct}/statement-entries", headers=bearer(TOKEN),
++                      params={"subject": subject, "period_start": iso(start), "period_end": iso(end),
++                              "limit": 1_000_000}).json()
++    assert len(body["items"]) <= 1000
++
++
++def test_export_capacity_returns_429(app, client):
++    subject, acct = ctx(app)
++    start, end = window()
++    sem = app.state.integration.exports
++    assert sem.acquire(timeout=1)
++    try:
++        resp = manifest(client, subject, acct, start, end)
++        assert resp.status_code == 429 and resp.headers["Retry-After"]
++    finally:
++        sem.release()
++    assert manifest(client, subject, acct, start, end).status_code == 200
++
++
++def test_reconciliation_failure_fails_closed(app, client):
++    subject, acct = ctx(app)
++    db = app.state.sessionmaker()
++    db.execute(update(Account).where(Account.id == acct).values(balance_minor=Account.balance_minor + 1))
++    db.commit()
++    db.close()
++    start, end = window()
++    resp = manifest(client, subject, acct, start, end)
++    assert resp.status_code == 500 and resp.json()["error"]["code"] == "ledger_reconciliation_failed"
++
++
++def test_manifest_is_audited_without_sensitive_data(app, client):
++    subject, acct = ctx(app)
++    start, end = window()
++    manifest(client, subject, acct, start, end)
++    db = app.state.sessionmaker()
++    ev = db.scalar(select(AuditEvent).where(AuditEvent.event_type == "integration.statement_manifest"))
++    number = db.scalar(select(Account.account_number).where(Account.id == acct))
++    db.close()
++    assert ev is not None and ev.details["client_id"] == "adapter"
++    assert number not in str(ev.details)
++
++
++# --- Discovery -----------------------------------------------------------------------
++
++
++def test_discovery_paginates_and_excludes_ineligible(app, client):
++    db = app.state.sessionmaker()
++    db.execute(update(User).where(User.username == "customer002").values(is_active=False))
++    db.commit()
++    expected = set(db.scalars(
++        select(Account.id).join(Customer).join(User)
++        .where(User.is_active.is_(True), User.is_load_test.is_(False), User.role == "customer",
++               Account.status == "active")).all())
++    db.close()
++    seen, after = [], 0
++    while True:
++        body = client.get("/internal/v1/discovery/statement-accounts", headers=bearer(DISCOVER_ONLY),
++                          params={"after_account_id": after, "limit": 2}).json()
++        seen += body["items"]
++        if not body["has_more"]:
++            break
++        after = body["next_after_account_id"]
++    assert {i["account_id"] for i in seen} == expected
++    assert all(i["subject"].startswith("nvb-user:") for i in seen)
++    assert all("account_number" not in i for i in seen)
++
++
++def test_discovery_requires_scope(app, client):
++    assert client.get("/internal/v1/discovery/statement-accounts", headers=bearer(SUMMARY)).status_code == 403
+-- 
+2.56.0.windows.4
+

@@ -1,0 +1,85 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: core-test-migrate
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: {nvb.io/component: core-test}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: core-cli
+        image: nvb-core
+        command: ["python", "-m", "app.cli", "migrate"]
+        envFrom:
+        - configMapRef: {name: core-test-config}
+        - secretRef: {name: core-test-seed}
+        env:
+        - name: NVB_DB_PASSWORD
+          valueFrom: {secretKeyRef: {name: core-test-db, key: password}}
+        - name: NVB_DB_MIGRATION_PASSWORD
+          valueFrom: {secretKeyRef: {name: core-test-db, key: password}}
+        resources:
+          requests: {cpu: 100m, memory: 256Mi}
+          limits: {cpu: "1", memory: 512Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          capabilities: {drop: ["ALL"]}
+          seccompProfile: {type: RuntimeDefault}
+        volumeMounts:
+        - {name: tmp, mountPath: /tmp}
+      volumes:
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: core-test-seed
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: {nvb.io/component: core-test}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: core-cli
+        image: nvb-core
+        command: ["python", "-m", "app.cli", "seed", "--credentials-file", "/tmp/demo-credentials.txt"]
+        envFrom:
+        - configMapRef: {name: core-test-config}
+        - secretRef: {name: core-test-seed}
+        env:
+        - name: NVB_DB_PASSWORD
+          valueFrom: {secretKeyRef: {name: core-test-db, key: password}}
+        - name: NVB_DB_MIGRATION_PASSWORD
+          valueFrom: {secretKeyRef: {name: core-test-db, key: password}}
+        resources:
+          requests: {cpu: 100m, memory: 256Mi}
+          limits: {cpu: "1", memory: 512Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          capabilities: {drop: ["ALL"]}
+          seccompProfile: {type: RuntimeDefault}
+        volumeMounts:
+        - {name: tmp, mountPath: /tmp}
+      volumes:
+      - name: tmp
+        emptyDir: {}

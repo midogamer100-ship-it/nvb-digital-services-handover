@@ -1,37 +1,42 @@
 # NVB Core Adapter image.
-# Build context: services/core-adapter
-#   podman build -f Containerfile --build-arg REVISION=$(git rev-parse HEAD) -t nvb-core-adapter:<version> .
-# OpenShift: runs as an arbitrary non-root UID in group 0; application files are read-only;
-# only /tmp (mount an emptyDir) is writable. No credentials are baked in: the core token,
-# the clients file and the CA bundle are mounted from Secrets/ConfigMaps at runtime.
+# BUILD CONTEXT = REPOSITORY ROOT (the image needs libs/, services/ and migrations/):
+#   podman build -f services/core-adapter/Containerfile --build-arg REVISION=$(git rev-parse HEAD) --build-arg VERSION=<version> \
+#       -t <registry>/nvb-core-adapter:<version> .
+# (scripts/build-images.sh does this for every image and records the digests.)
+# OpenShift: runs as an arbitrary non-root UID in group 0; application files are read-only; only
+# /tmp (emptyDir) is writable. No credentials are baked in. No git, no "git pull" at start-up:
+# the image IS the release.
 # TODO(infra): pin the base image by digest once the registry mirror is agreed.
-FROM registry.access.redhat.com/ubi9/python-312:latest AS build
+ARG BASE_IMAGE=registry.access.redhat.com/ubi9/python-312:latest
+FROM ${BASE_IMAGE} AS build
 USER 0
 WORKDIR /build
-COPY requirements.txt .
+COPY services/core-adapter/requirements.txt requirements.txt
 RUN python -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
  && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
-FROM registry.access.redhat.com/ubi9/python-312:latest
+FROM ${BASE_IMAGE}
 ARG REVISION=unknown
-ARG VERSION=0.1.0
+ARG VERSION=0.0.0
 LABEL org.opencontainers.image.title="nvb-core-adapter" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.source="nvb-digital-services" \
       org.opencontainers.image.description="NVB extension Core Adapter - synthetic demo data only"
 USER 0
 COPY --from=build /opt/venv /opt/venv
-COPY core_adapter /opt/app/core_adapter
+COPY services/core-adapter/core_adapter /opt/app/core_adapter
 RUN chown -R 0:0 /opt/app /opt/venv && chmod -R g=u-w,o-w /opt/app && chmod -R a-w /opt/app
 ENV PATH=/opt/venv/bin:$PATH \
+    PYTHONPATH=/opt/app \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     TMPDIR=/tmp \
     ADAPTER_BUILD_REVISION=${REVISION}
 WORKDIR /opt/app
 USER 1001
-EXPOSE 8080
-# uvicorn handles SIGTERM with graceful shutdown (in-flight requests finish within the timeout).
-CMD ["uvicorn", "--factory", "core_adapter.app:app_factory", "--host", "0.0.0.0", "--port", "8080", \
-     "--proxy-headers", "--forwarded-allow-ips", "127.0.0.1", "--timeout-graceful-shutdown", "20", \
-     "--no-server-header"]
+EXPOSE 8443
+# TLS: set UVICORN_SSL_CERTFILE / UVICORN_SSL_KEYFILE (uvicorn reads UVICORN_* variables) to the
+# mounted service-serving certificate. uvicorn handles SIGTERM gracefully (in-flight requests finish).
+CMD ["uvicorn", "--factory", "core_adapter.app:app_factory", "--host", "0.0.0.0", "--port", "8443", \
+     "--timeout-graceful-shutdown", "20", "--no-server-header"]

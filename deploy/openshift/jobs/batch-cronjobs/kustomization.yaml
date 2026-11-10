@@ -1,0 +1,8 @@
+# Scheduled batch triggers. They run the SAME operation as the staff API (create_batch /
+# create_summary_batch). Created suspended; history limits bound completed Jobs. They only create
+# batch rows + outbox messages; the work itself is done by the bounded workers.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- statements-monthly-batch.yaml
+- loans-summary-batch.yaml

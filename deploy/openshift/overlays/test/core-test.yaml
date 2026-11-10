@@ -1,0 +1,96 @@
+# ISOLATED PATCHED CORE for the test namespace (synthetic data, its own database nvb_core_test on
+# the disposable PostgreSQL). Image = the core repository's own Containerfile built at the
+# integration revision (see docs/CORE_PATCH.md): REPLACE_REGISTRY/nvb-core:<core revision>.
+# It serves TLS with a service-serving certificate so that the adapter and the gateway exercise
+# the same verified-TLS path they use against the real core.
+# The schema and seed are created by the two Jobs below (the core's own CLI). This Deployment is
+# NOT the production core and shares nothing with the core VM pool.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: core-test-config
+data:
+  NVB_DB_HOST: "postgres.nvb-digital-test.svc"
+  NVB_DB_PORT: "5432"
+  NVB_DB_NAME: "nvb_core_test"
+  NVB_DB_USER: "nvb_core_test"
+  NVB_DB_MIGRATION_USER: "nvb_core_test"
+  NVB_COOKIE_SECURE: "true"
+  NVB_ENVIRONMENT_LABEL: "Disposable test"
+  NVB_INTEGRATION_ENABLED: "true"
+  NVB_INTEGRATION_CLIENTS_FILE: "/var/run/secrets/nvb/integration/clients.json"
+  NVB_INTEGRATION_SETTLE_SECONDS: "300"
+  NVB_INTEGRATION_MAX_CONCURRENT_EXPORTS: "2"
+  NVB_INTEGRATION_MAX_PAGE_SIZE: "1000"
+  NVB_INTEGRATION_MAX_STATEMENT_ENTRIES: "250000"
+  UVICORN_SSL_CERTFILE: "/etc/nvb/tls/tls.crt"
+  UVICORN_SSL_KEYFILE: "/etc/nvb/tls/tls.key"
+  WEB_CONCURRENCY: "2"
+  FORWARDED_ALLOW_IPS: "127.0.0.1"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: core-test
+  labels: {nvb.io/component: core-test}
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: core-test-tls
+spec:
+  selector: {nvb.io/component: core-test}
+  ports:
+  - {name: https, port: 8443, targetPort: 8080}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: core-test
+  labels: {nvb.io/component: core-test}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {nvb.io/component: core-test}
+  template:
+    metadata:
+      labels: {nvb.io/component: core-test}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: core
+        image: nvb-core
+        ports:
+        - {name: https, containerPort: 8080}
+        envFrom:
+        - configMapRef: {name: core-test-config}
+        env:
+        - name: NVB_DB_PASSWORD
+          valueFrom: {secretKeyRef: {name: core-test-db, key: password}}
+        - name: NVB_DB_MIGRATION_PASSWORD
+          valueFrom: {secretKeyRef: {name: core-test-db, key: password}}
+        readinessProbe:
+          httpGet: {path: /health/ready, port: https, scheme: HTTPS}
+          periodSeconds: 10
+        livenessProbe:
+          httpGet: {path: /health/live, port: https, scheme: HTTPS}
+          periodSeconds: 20
+        resources:
+          requests: {cpu: 100m, memory: 256Mi}
+          limits: {cpu: "1", memory: 768Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          capabilities: {drop: ["ALL"]}
+          seccompProfile: {type: RuntimeDefault}
+        volumeMounts:
+        - {name: tls, mountPath: /etc/nvb/tls, readOnly: true}
+        - {name: integration, mountPath: /var/run/secrets/nvb/integration, readOnly: true}
+        - {name: tmp, mountPath: /tmp}
+      volumes:
+      - name: tls
+        secret: {secretName: core-test-tls}
+      - name: integration
+        secret: {secretName: core-integration-clients}
+      - name: tmp
+        emptyDir: {}

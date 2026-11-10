@@ -1,0 +1,218 @@
+# loans-api (Deployment + Service) and loans-relay (Deployment, no Service). Workers are Jobs.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loans-api
+  labels:
+    app.kubernetes.io/name: loans-api
+    app.kubernetes.io/part-of: nvb-digital
+    nvb.io/component: loans-api
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector:
+    matchLabels:
+      nvb.io/component: loans-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: loans-api
+        app.kubernetes.io/part-of: nvb-digital
+        nvb.io/component: loans-api
+    spec:
+      serviceAccountName: loans-api
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: loans-api
+        image: nvb-loans
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: https
+          containerPort: 8443
+        envFrom:
+        - configMapRef:
+            name: loans-config
+        env:
+        - name: UVICORN_SSL_CERTFILE
+          value: "/etc/nvb/tls/tls.crt"
+        - name: UVICORN_SSL_KEYFILE
+          value: "/etc/nvb/tls/tls.key"
+        - name: LOANS_DATABASE_PASSWORD_FILE
+          value: "/var/run/secrets/nvb/db/password"
+        - name: LOANS_ADAPTER_TOKEN_FILE
+          value: "/var/run/secrets/nvb/adapter/token"
+        - name: LOANS_ADAPTER_CA_FILE
+          value: "/etc/nvb/service-ca/service-ca.crt"
+        startupProbe:
+          httpGet: {path: /health/live, port: https, scheme: HTTPS}
+          periodSeconds: 3
+          failureThreshold: 40
+        livenessProbe:
+          httpGet: {path: /health/live, port: https, scheme: HTTPS}
+          periodSeconds: 20
+          timeoutSeconds: 3
+          failureThreshold: 3
+        readinessProbe:
+          httpGet: {path: /health/ready, port: https, scheme: HTTPS}
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests: {cpu: 50m, memory: 128Mi}
+          limits: {cpu: 500m, memory: 384Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          capabilities:
+            drop: ["ALL"]
+          seccompProfile:
+            type: RuntimeDefault
+        volumeMounts:
+        - name: tls
+          mountPath: /etc/nvb/tls
+          readOnly: true
+        - name: db
+          mountPath: /var/run/secrets/nvb/db
+          readOnly: true
+        - name: adapter-token
+          mountPath: /var/run/secrets/nvb/adapter
+          readOnly: true
+        - name: service-ca
+          mountPath: /etc/nvb/service-ca
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tls
+        secret:
+          secretName: loans-api-tls
+          defaultMode: 0440
+      - name: db
+        secret:
+          secretName: loans-db-app
+          defaultMode: 0440
+      - name: adapter-token
+        secret:
+          secretName: adapter-token-loans-api
+          defaultMode: 0440
+      - name: service-ca
+        configMap:
+          name: nvb-service-ca
+      - name: tmp
+        emptyDir:
+          sizeLimit: 256Mi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loans-api
+  labels:
+    app.kubernetes.io/name: loans-api
+    app.kubernetes.io/part-of: nvb-digital
+    nvb.io/component: loans-api
+  annotations:
+    # OpenShift service CA issues loans-api-tls for loans-api.<namespace>.svc (no operator to install).
+    service.beta.openshift.io/serving-cert-secret-name: loans-api-tls
+spec:
+  selector:
+    nvb.io/component: loans-api
+  ports:
+  - name: https
+    port: 8443
+    targetPort: https
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loans-relay
+  labels:
+    app.kubernetes.io/name: loans-relay
+    app.kubernetes.io/part-of: nvb-digital
+    nvb.io/component: loans-relay
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      nvb.io/component: loans-relay
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: loans-relay
+        app.kubernetes.io/part-of: nvb-digital
+        nvb.io/component: loans-relay
+    spec:
+      serviceAccountName: loans-relay
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: loans-relay
+        image: nvb-loans
+        imagePullPolicy: IfNotPresent
+        command: ["python", "-m", "nvb_loans.relay"]
+        envFrom:
+        - configMapRef:
+            name: loans-config
+        env:
+        - name: LOANS_DATABASE_PASSWORD_FILE
+          value: "/var/run/secrets/nvb/db/password"
+        - name: LOANS_BROKER_USERNAME_FILE
+          value: "/var/run/secrets/nvb/broker/username"
+        - name: LOANS_BROKER_PASSWORD_FILE
+          value: "/var/run/secrets/nvb/broker/password"
+        - name: LOANS_RELAY_HEARTBEAT_FILE
+          value: "/tmp/relay-heartbeat"
+        livenessProbe:
+          exec:
+            command: ["python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.path.getmtime('/tmp/relay-heartbeat') < 180 else 1)"]
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          failureThreshold: 3
+        resources:
+          requests: {cpu: 25m, memory: 96Mi}
+          limits: {cpu: 250m, memory: 256Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          capabilities:
+            drop: ["ALL"]
+          seccompProfile:
+            type: RuntimeDefault
+        volumeMounts:
+        - name: db
+          mountPath: /var/run/secrets/nvb/db
+          readOnly: true
+        - name: broker
+          mountPath: /var/run/secrets/nvb/broker
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: db
+        secret:
+          secretName: loans-db-app
+          defaultMode: 0440
+      - name: broker
+        secret:
+          secretName: loans-broker
+          defaultMode: 0440
+      - name: tmp
+        emptyDir:
+          sizeLimit: 256Mi

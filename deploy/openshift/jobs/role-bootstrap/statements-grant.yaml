@@ -1,0 +1,65 @@
+# Bootstrap of the FIRST extension_admin of a service (nobody can grant it through the API yet).
+# Reviewed one-off Job: edit --subject (shown on the portal's "My identity" page), --actor and
+# --reason in a copy of this file, then apply it once and delete the finished Job.
+# Every grant is recorded in the append-only role_events table.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: statements-role-grant
+  labels:
+    app.kubernetes.io/part-of: nvb-digital
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: statements-ops
+        app.kubernetes.io/part-of: nvb-digital
+        nvb.io/component: statements-ops
+    spec:
+      serviceAccountName: statements-ops
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: statements-ops
+        image: nvb-statements
+        imagePullPolicy: IfNotPresent
+        command: ["python", "-m", "nvb_statements.admin", "grant", "--subject", "nvb-user:REPLACE_ID:REPLACE_CREATED", "--role", "extension_admin", "--actor", "ops:REPLACE_NAME_OR_TICKET", "--reason", "bootstrap"]
+        envFrom:
+        - configMapRef:
+            name: statements-config
+        env:
+        - name: STATEMENTS_DATABASE_PASSWORD_FILE
+          value: "/var/run/secrets/nvb/db/password"
+        resources:
+          requests: {cpu: 25m, memory: 96Mi}
+          limits: {cpu: 250m, memory: 256Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          capabilities:
+            drop: ["ALL"]
+          seccompProfile:
+            type: RuntimeDefault
+        volumeMounts:
+        - name: db
+          mountPath: /var/run/secrets/nvb/db
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: db
+        secret:
+          secretName: statements-db-app
+          defaultMode: 0440
+      - name: tmp
+        emptyDir:
+          sizeLimit: 256Mi

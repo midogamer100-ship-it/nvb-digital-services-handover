@@ -1,0 +1,10 @@
+[project]
+name = "nvb-loans"
+version = "0.1.0"
+description = "NVB loan applications extension (synthetic demo data only; no disbursement)"
+requires-python = ">=3.12,<3.13"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "../../libs/nvb_platform"]
+addopts = "-q -p no:cacheprovider"

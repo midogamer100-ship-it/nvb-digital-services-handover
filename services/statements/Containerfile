@@ -1,39 +1,50 @@
-# NVB Statements image (statements-api, statements-relay, statements-worker).
-# Build context: services/statements (migrations copied separately for the migration Job image)
-#   podman build -f Containerfile --build-arg REVISION=$(git rev-parse HEAD) -t nvb-statements:<version> .
-# OpenShift: runs as an arbitrary non-root UID in group 0; application files are read-only;
-# only /tmp (mount an emptyDir) is writable. No credentials are baked in: the core token,
-# the clients file and the CA bundle are mounted from Secrets/ConfigMaps at runtime.
+# NVB Statements image: statements-api, statements-relay, statements-worker, batch command, role command AND the statements migrations (one immutable image, different commands).
+# BUILD CONTEXT = REPOSITORY ROOT (the image needs libs/, services/ and migrations/):
+#   podman build -f services/statements/Containerfile --build-arg REVISION=$(git rev-parse HEAD) --build-arg VERSION=<version> \
+#       -t <registry>/nvb-statements:<version> .
+# (scripts/build-images.sh does this for every image and records the digests.)
+# OpenShift: runs as an arbitrary non-root UID in group 0; application files are read-only; only
+# /tmp (emptyDir) is writable. No credentials are baked in. No git, no "git pull" at start-up:
+# the image IS the release.
 # TODO(infra): pin the base image by digest once the registry mirror is agreed.
-FROM registry.access.redhat.com/ubi9/python-312:latest AS build
+ARG BASE_IMAGE=registry.access.redhat.com/ubi9/python-312:latest
+FROM ${BASE_IMAGE} AS build
 USER 0
 WORKDIR /build
-COPY requirements.txt .
+COPY services/statements/requirements.txt requirements.txt
 RUN python -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
  && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
-FROM registry.access.redhat.com/ubi9/python-312:latest
+FROM ${BASE_IMAGE}
 ARG REVISION=unknown
-ARG VERSION=0.1.0
+ARG VERSION=0.0.0
 LABEL org.opencontainers.image.title="nvb-statements" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.source="nvb-digital-services" \
       org.opencontainers.image.description="NVB statements extension - synthetic demo data only"
 USER 0
 COPY --from=build /opt/venv /opt/venv
-COPY nvb_statements /opt/app/nvb_statements
+COPY libs/nvb_platform/nvb_platform /opt/app/nvb_platform
+COPY services/statements/nvb_statements /opt/app/nvb_statements
+COPY migrations/statements /opt/app/migrations/statements
 RUN chown -R 0:0 /opt/app /opt/venv && chmod -R g=u-w,o-w /opt/app && chmod -R a-w /opt/app
 ENV PATH=/opt/venv/bin:$PATH \
+    PYTHONPATH=/opt/app \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     TMPDIR=/tmp \
     STATEMENTS_BUILD_REVISION=${REVISION}
 WORKDIR /opt/app
 USER 1001
-EXPOSE 8080
-# uvicorn handles SIGTERM with graceful shutdown (in-flight requests finish within the timeout).
-# Default command = statements-api. The same immutable image runs the other components with a
-# command override in their own Deployment/Job (separately deployable and scalable):
-#   relay : ["python", "-m", "nvb_statements.relay"]
-#   worker: ["python", "-m", "nvb_statements.worker", "--drain"]      (Kubernetes Job / KEDA ScaledJob)
-CMD ["uvicorn", "--factory", "nvb_statements.api:app_factory", "--host", "0.0.0.0", "--port", "8080",      "--proxy-headers", "--forwarded-allow-ips", "127.0.0.1", "--timeout-graceful-shutdown", "20",      "--no-server-header"]
+EXPOSE 8443
+# Default command = statements-api. Other components override the command:
+#   relay     : ["python", "-m", "nvb_statements.relay"]
+#   worker    : ["python", "-m", "nvb_statements.worker", "--drain"]          (Job / KEDA ScaledJob)
+#   batch     : ["python", "-m", "nvb_statements.batch", "create", "--period", "previous-month"]  (CronJob)
+#   roles     : ["python", "-m", "nvb_statements.admin", "grant", ...]         (one-off Job)
+#   migration : ["alembic", "-c", "/opt/app/migrations/statements/alembic.ini", "upgrade", "head"]
+# TLS: set UVICORN_SSL_CERTFILE / UVICORN_SSL_KEYFILE (uvicorn reads UVICORN_* variables) to the
+# mounted service-serving certificate. uvicorn handles SIGTERM gracefully (in-flight requests finish).
+CMD ["uvicorn", "--factory", "nvb_statements.api:app_factory", "--host", "0.0.0.0", "--port", "8443", \
+     "--timeout-graceful-shutdown", "20", "--no-server-header"]

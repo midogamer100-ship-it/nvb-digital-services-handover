@@ -1,36 +1,71 @@
 # nvb-digital-services
 
-Extension services around the NVB demo core (Statements, Loan Applications, Batch Processing) for an
-OpenShift modernization proof of concept. **Synthetic demo data only. No real disbursement, credit bureau,
-messaging or production banking.** Conceptually inspired by modernization around a banking core; it does not
-reproduce any specific bank's internal architecture.
+Containerised extension services around the NVB demo core banking application for an OpenShift
+modernisation proof of concept: **PDF account statements, loan applications (workflow only) and
+batch processing**. The core keeps running on its VM pool and stays authoritative for customers,
+accounts, balances and every financial posting.
 
-> Local repository only — no remote has been created and nothing has been pushed or deployed.
+**Synthetic demo data only. No disbursement, no real messaging, no production banking.**
+Local repository only: nothing has been pushed, published or deployed.
+
+## Readiness — stated precisely
+
+| Achievement | Status |
+| --- | --- |
+| Code implemented | **Yes** — core adapter, statements (api/relay/worker/batch), loans (api/relay/worker/batch), gateway, portal, migrations, core patch |
+| Local integration tested | **Yes** — against real, disposable PostgreSQL 16, RabbitMQ 3.13 and an S3-compatible store, a patched core on PostgreSQL, real nginx and a real browser (results: `docs/TESTING.md`) |
+| Manifests validated | **Yes, offline** — kustomize build + kubeconform schema + policy checks (`scripts/validate_manifests.py`) |
+| Image built | **No** — no container engine on the authoring workstation. Containerfiles are verified structurally and by running every image command from the assembled layout (`scripts/verify_image_layout.py`) |
+| OpenShift deployment tested | **No** — nothing was applied to any cluster |
+
+Therefore this is **ready for an isolated OpenShift test deployment to be attempted** by the
+infrastructure team following `docs/RUNBOOK.md`; it is not "deployed" or "validated on OpenShift".
+Open items: `docs/BLOCKERS.md`.
+
+## Components
+
+| Path | What | State |
+| --- | --- | --- |
+| `services/core-adapter` | Only component that calls the core's `/internal/v1`; bounded concurrency/rate; validates the contract | implemented, tested |
+| `services/statements` | One image, several commands: `statements-api`, `statements-relay` (outbox → RabbitMQ, reconciler), `statements-worker` (PDF), batch command, role command, migrations | implemented, tested |
+| `services/loans` | One image: `loans-api`, `loans-relay`, `loans-worker` (synthetic summary), batch command, role command, migrations | implemented, tested |
+| `libs/nvb_platform` | Shared library: broker, outbox, adapter client, dataset verification, roles, browser identity | implemented, tested through the services |
+| `gateway/` | nginx same-origin gateway (config template + renderer) | implemented, tested with real nginx |
+| `portal/` | Static single-page portal (no build step, no third-party JavaScript): customer and staff pages | implemented, browser-tested |
+| `migrations/{statements,loans}` | Alembic migrations, shipped inside the service images | tested on PostgreSQL (fresh install and upgrade path) |
+| `core-patch/` + `docs/CORE_PATCH.md` | Additive core patch `ffd3201 → 09730f5` as a patch series, with rollout/rollback | tested on SQLite and PostgreSQL; not deployed |
+| `deploy/openshift` | kustomize base, `overlays/test` (disposable namespace + throw-away dependencies + isolated test core), `overlays/poc`, Jobs, CronJobs, optional KEDA ScaledJobs, secret templates | validated offline; never applied |
+| `deploy/local`, `scripts/local_stack.py`, `scripts/local_run.py` | Disposable local dependencies and the full stack over real sockets (no containers needed) | used for all integration tests |
+| `contracts/` | Core integration contract, extension API / adapter / queue contracts | current |
+| `tests/` | `contract`, `e2e` (in-process), `integration` (real dependencies), `gateway` (real nginx + browser), `load` (finite, guarded) | see `docs/TESTING.md` |
 
 ## Principles
 
-* The core stays authoritative for balances and financial transactions. Nothing here posts money;
-  loan "approval" is an extension workflow state only.
-* Services reach the core only through `services/core-adapter` → the core's authenticated `/internal/v1`
-  API (disabled by default, see `contracts/core-integration-v1.md`). No core DB access or credentials.
+* New services never touch core tables; they call the core only through the adapter with scoped,
+  hashed service credentials over verified TLS.
+* Identity = the core session, verified at the core on every request. Staff capabilities are
+  explicit extension role assignments; core roles grant nothing.
+* Loan approval is a workflow decision. Nothing posts money.
 * Money is integer minor units end to end.
-* Every API and worker is separately runnable and deployable; images run as arbitrary non-root UIDs.
+* Images are immutable releases; containers never pull code. Secrets are mounted files.
+* No statement is ever generated from a partial or drifting dataset.
 
-## Layout
+## Quick start (laptop, Windows, no containers)
 
 ```
-services/core-adapter      ✅ M1  stable contract over the core API
-services/statements-api    ⏳ M2
-services/statements-worker ⏳ M2
-services/loans-api         ☐ M4
-services/loans-worker      ☐ M5
-portal/ gateway/ batch/    ⏳ M2–M3
-contracts/                 core integration + adapter contracts
-migrations/{statements,loans}
-deploy/{local,openshift}   manifests are prepared for review, never applied automatically
-tests/{contract,integration,e2e,load}
-docs/                      findings, plan, testing
-scripts/safe_core_tests.py guarded runner for the core's destructive test fixture
+python -m venv .venv && .venv\Scripts\pip install -r services/statements/requirements-dev.txt -r services/loans/requirements-dev.txt pyyaml playwright
+python scripts/local_stack.py fetch     # portable PostgreSQL / Erlang+RabbitMQ / SeaweedFS / nginx (checksummed)
+python scripts/local_stack.py start     # disposable, loopback only, random credentials in .local/secrets
+python scripts/local_run.py up          # patched core + adapter + statements + loans + relays + gateway
+# portal: http://127.0.0.1:18080   demo passwords: .local/run/demo-passwords.json
+python scripts/local_run.py worker statements
+python scripts/local_run.py down && python scripts/local_stack.py stop
 ```
+With podman/docker instead: `deploy/local/compose.yaml` (dependencies only; not run by the authors).
 
-See `docs/M1_FINDINGS_AND_DECISIONS.md`, `docs/IMPLEMENTATION_PLAN.md`, `docs/TESTING.md`.
+## Documents
+
+`docs/RUNBOOK.md` (deployment order, rollback, troubleshooting, cutover) ·
+`docs/CONFIGURATION.md` (every variable, secrets, TLS, rotation) · `docs/CORE_PATCH.md` ·
+`docs/DESIGN.md` (gateway, consistency, roles, durability, scaling) · `docs/TESTING.md` ·
+`docs/DEMO_SCRIPT.md` · `docs/BLOCKERS.md` · `contracts/*.md` · `deploy/openshift/secrets/README.md`

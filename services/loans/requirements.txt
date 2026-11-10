@@ -1,0 +1,13 @@
+# Pinned runtime dependencies for loans-api, loans-relay and loans-worker (Python 3.12).
+fastapi==0.115.12
+starlette==0.46.2
+uvicorn[standard]==0.34.2
+pydantic==2.11.5
+pydantic-settings==2.9.1
+httpx==0.28.1
+prometheus-client==0.22.0
+SQLAlchemy==2.0.41
+alembic==1.16.1
+psycopg[binary]==3.2.9
+pika==1.3.2
+tzdata==2025.2

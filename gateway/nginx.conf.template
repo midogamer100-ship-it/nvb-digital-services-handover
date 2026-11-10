@@ -1,0 +1,180 @@
+# NVB digital gateway: ONE browser origin for the portal, the core's login/session API and the
+# extension APIs. Rendered by gateway/render_config.py (container entrypoint and local tests use
+# the same template). @@NAME@@ placeholders are replaced; rendering fails if any is missing.
+#
+# Routing is an explicit allowlist. Order of precedence (most specific first):
+#   = /gateway/health                 -> answered here
+#   ^~ /internal/ , = /metrics , ^~ /health/   -> 404 here (never proxied anywhere)
+#   ^~ /x/statements/                 -> statements-api
+#   ^~ /x/loans/                      -> loans-api
+#   ^~ /x/                            -> 404 here
+#   = /api/auth/login|logout|me       -> core (existing session API, unchanged)
+#   ^~ /api/                          -> 404 here (no other core API is exposed on this origin)
+#   /                                 -> portal static files, SPA fallback to /index.html
+# The core's own SPA fallback can therefore never answer on this origin, and unknown /api or /x
+# paths return JSON 404 instead of the portal's index.html.
+
+worker_processes @@WORKER_PROCESSES@@;
+pid @@RUN_DIR@@/nginx.pid;
+error_log @@ERROR_LOG@@ warn;
+
+events { worker_connections 1024; }
+
+http {
+    include       @@MIME_TYPES@@;
+    default_type  application/octet-stream;
+    server_tokens off;
+
+    # No request bodies, cookies, Authorization headers or query strings in the access log.
+    log_format gw '$time_iso8601 rid=$request_id $remote_addr "$request_method $uri" $status '
+                  '$body_bytes_sent rt=$request_time up=$upstream_addr us=$upstream_status';
+    access_log @@ACCESS_LOG@@ gw;
+
+    client_body_temp_path @@RUN_DIR@@/client_body;
+    proxy_temp_path       @@RUN_DIR@@/proxy;
+    fastcgi_temp_path     @@RUN_DIR@@/fastcgi;
+    uwsgi_temp_path       @@RUN_DIR@@/uwsgi;
+    scgi_temp_path        @@RUN_DIR@@/scgi;
+
+    client_max_body_size 64k;
+    client_body_timeout 15s;
+    client_header_timeout 15s;
+    keepalive_timeout 30s;
+    large_client_header_buffers 4 8k;
+
+    # Login abuse protection at the edge: the core sees the gateway as the client address.
+    limit_req_zone $binary_remote_addr zone=login:10m rate=@@LOGIN_RATE@@;
+    limit_req_status 429;
+
+    # Defence in depth on top of the core's CSRF token and SameSite=Lax: a state-changing request
+    # that carries an Origin header must come from this origin.
+    map $http_origin $origin_ok {
+        default 0;
+        ""      1;
+        "@@PUBLIC_ORIGIN@@" 1;
+    }
+    map $request_method $unsafe_method {
+        default 1;
+        GET     0;
+        HEAD    0;
+        OPTIONS 0;
+    }
+    map "$unsafe_method:$origin_ok" $reject_origin {
+        default 0;
+        "1:0"   1;
+    }
+
+    server {
+        listen @@LISTEN@@;
+        server_name _;
+@@TLS_SERVER_DIRECTIVES@@
+
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "DENY" always;
+        add_header Referrer-Policy "no-referrer" always;
+        add_header Content-Security-Policy "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'" always;
+        add_header Strict-Transport-Security "max-age=31536000" always;
+
+        # ---- headers sent to every upstream --------------------------------------------------
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $proxy_host;
+        proxy_set_header X-Request-ID $request_id;
+        # Overwritten (not appended): a client cannot inject forwarding information.
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Forwarded "";
+        # Identity is ONLY the core session cookie, verified by the core on every request.
+        # Client-supplied identity/role/service-credential headers are removed.
+        proxy_set_header Authorization "";
+        proxy_set_header X-User "";
+        proxy_set_header X-Role "";
+        proxy_set_header X-Roles "";
+        proxy_set_header X-Subject "";
+        proxy_set_header X-Username "";
+        proxy_set_header X-Remote-User "";
+        proxy_set_header X-Forwarded-User "";
+        proxy_set_header X-Forwarded-Email "";
+        proxy_set_header X-Forwarded-Groups "";
+        proxy_set_header X-Auth-Request-User "";
+        proxy_set_header X-Auth-Request-Email "";
+        proxy_set_header X-Auth-Request-Groups "";
+        proxy_set_header X-Customer-Id "";
+        proxy_set_header X-Extension-Roles "";
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 60s;
+        proxy_send_timeout 15s;
+        proxy_buffering on;
+        proxy_intercept_errors off;
+        proxy_redirect off;
+
+        error_page 404 = @json404;
+        error_page 502 503 504 = @json503;
+        location @json404 {
+            default_type application/json;
+            return 404 '{"error":{"code":"not_found","message":"Not found."}}';
+        }
+        location @json503 {
+            default_type application/json;
+            return 503 '{"error":{"code":"upstream_unavailable","message":"Service temporarily unavailable."}}';
+        }
+
+        location = /gateway/health {
+            access_log off;
+            default_type text/plain;
+            return 200 "ok\n";
+        }
+
+        # Never reachable through the public origin.
+        location ^~ /internal/ { return 404; }
+        location ^~ /health/   { return 404; }
+        location = /metrics    { return 404; }
+
+        # ---- extension APIs ---------------------------------------------------------------------
+        location ^~ /x/statements/ {
+            if ($reject_origin) { return 403; }
+@@INTERNAL_TLS_DIRECTIVES@@
+            proxy_pass @@STATEMENTS_UPSTREAM@@;
+        }
+        location ^~ /x/loans/ {
+            if ($reject_origin) { return 403; }
+@@INTERNAL_TLS_DIRECTIVES@@
+            proxy_pass @@LOANS_UPSTREAM@@;
+        }
+        location ^~ /x/ { return 404; }
+
+        # ---- core session API (login / logout / current user) --------------------------------------
+        location = /api/auth/login {
+            limit_except POST { deny all; }
+            if ($reject_origin) { return 403; }
+            limit_req zone=login burst=@@LOGIN_BURST@@ nodelay;
+@@CORE_TLS_DIRECTIVES@@
+            proxy_pass @@CORE_UPSTREAM@@;
+        }
+        location = /api/auth/logout {
+            limit_except POST { deny all; }
+            if ($reject_origin) { return 403; }
+@@CORE_TLS_DIRECTIVES@@
+            proxy_pass @@CORE_UPSTREAM@@;
+        }
+        location = /api/auth/me {
+            limit_except GET { deny all; }
+@@CORE_TLS_DIRECTIVES@@
+            proxy_pass @@CORE_UPSTREAM@@;
+        }
+        location ^~ /api/ { return 404; }
+
+        # ---- portal (static single-page app) --------------------------------------------------------
+        location / {
+            limit_except GET { deny all; }
+            root @@PORTAL_ROOT@@;
+            add_header Cache-Control "no-cache" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            add_header X-Frame-Options "DENY" always;
+            add_header Referrer-Policy "no-referrer" always;
+            add_header Content-Security-Policy "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'" always;
+            add_header Strict-Transport-Security "max-age=31536000" always;
+            try_files $uri /index.html;
+        }
+    }
+}

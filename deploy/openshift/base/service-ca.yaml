@@ -1,0 +1,11 @@
+# The OpenShift service CA injects its bundle (key service-ca.crt) into this ConfigMap. Clients
+# mount it to verify in-cluster TLS (CA + hostname) for core-adapter / statements-api / loans-api.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nvb-service-ca
+  labels:
+    app.kubernetes.io/part-of: nvb-digital
+  annotations:
+    service.beta.openshift.io/inject-cabundle: "true"
+data: {}

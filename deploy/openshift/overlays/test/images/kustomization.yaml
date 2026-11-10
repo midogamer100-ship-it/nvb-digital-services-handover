@@ -1,0 +1,33 @@
+# Single place for the image references of this environment. Every kustomization of the overlay
+# includes this component, so workloads, Jobs and ScaledJobs always use the SAME release.
+# Test namespace: the internal registry is fine, e.g. image-registry.openshift-image-registry.svc:5000/nvb-digital-test
+# Use digests from dist/images-<version>.txt (scripts/build-images.sh):  newName + digest.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+images:
+- name: nvb-core-adapter
+  newName: REPLACE_REGISTRY/nvb-core-adapter
+  newTag: REPLACE_VERSION        # replace newTag by `digest: sha256:...` for the shared PoC
+- name: nvb-statements
+  newName: REPLACE_REGISTRY/nvb-statements
+  newTag: REPLACE_VERSION
+- name: nvb-loans
+  newName: REPLACE_REGISTRY/nvb-loans
+  newTag: REPLACE_VERSION
+- name: nvb-gateway
+  newName: REPLACE_REGISTRY/nvb-gateway
+  newTag: REPLACE_VERSION
+# Disposable dependency images - INFRA MUST CONFIRM / mirror (see ../../../dependencies-test).
+- name: test-postgres
+  newName: quay.io/sclorg/postgresql-16-c9s
+  newTag: latest
+- name: test-rabbitmq
+  newName: docker.io/library/rabbitmq
+  newTag: 3.13-alpine
+- name: test-objectstore
+  newName: docker.io/chrislusf/seaweedfs
+  newTag: "3.97"
+# Isolated test core image (built from the CORE repository at the integration revision).
+- name: nvb-core
+  newName: REPLACE_REGISTRY/nvb-core
+  newTag: REPLACE_CORE_VERSION

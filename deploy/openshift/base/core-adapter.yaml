@@ -1,0 +1,136 @@
+# Core Adapter: the ONLY component allowed to call the core's /internal/v1 API.
+# replicas is fixed at 1 on purpose: the fleet-wide bound on concurrent core calls is
+#   replicas x ADAPTER_CORE_MAX_CONCURRENCY  (and replicas x ADAPTER_CORE_RATE_PER_SECOND).
+# Do not add replicas or an autoscaler without lowering the per-replica values accordingly;
+# scripts/validate_manifests.py enforces replicas x concurrency <= nvb.io/core-fleet-max-concurrency.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: core-adapter
+  labels:
+    app.kubernetes.io/name: core-adapter
+    app.kubernetes.io/part-of: nvb-digital
+    nvb.io/component: core-adapter
+  annotations:
+    nvb.io/core-fleet-max-concurrency: "4"
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector:
+    matchLabels:
+      nvb.io/component: core-adapter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: core-adapter
+        app.kubernetes.io/part-of: nvb-digital
+        nvb.io/component: core-adapter
+    spec:
+      serviceAccountName: core-adapter
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: core-adapter
+        image: nvb-core-adapter
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: https
+          containerPort: 8443
+        envFrom:
+        - configMapRef:
+            name: core-adapter-config
+        env:
+        - name: UVICORN_SSL_CERTFILE
+          value: "/etc/nvb/tls/tls.crt"
+        - name: UVICORN_SSL_KEYFILE
+          value: "/etc/nvb/tls/tls.key"
+        - name: ADAPTER_CORE_TOKEN_FILE
+          value: "/var/run/secrets/nvb/core/token"
+        - name: ADAPTER_CLIENTS_FILE
+          value: "/var/run/secrets/nvb/clients/clients.json"
+        startupProbe:
+          httpGet: {path: /health/live, port: https, scheme: HTTPS}
+          periodSeconds: 3
+          failureThreshold: 40
+        livenessProbe:
+          httpGet: {path: /health/live, port: https, scheme: HTTPS}
+          periodSeconds: 20
+          timeoutSeconds: 3
+          failureThreshold: 3
+        readinessProbe:
+          httpGet: {path: /health/ready, port: https, scheme: HTTPS}
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests: {cpu: 50m, memory: 96Mi}
+          limits: {cpu: 500m, memory: 256Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          capabilities:
+            drop: ["ALL"]
+          seccompProfile:
+            type: RuntimeDefault
+        volumeMounts:
+        - name: tls
+          mountPath: /etc/nvb/tls
+          readOnly: true
+        - name: core-token
+          mountPath: /var/run/secrets/nvb/core
+          readOnly: true
+        - name: clients
+          mountPath: /var/run/secrets/nvb/clients
+          readOnly: true
+        - name: core-ca
+          mountPath: /etc/nvb/core-ca
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tls
+        secret:
+          secretName: core-adapter-tls
+          defaultMode: 0440
+      - name: core-token
+        secret:
+          secretName: core-adapter-core-token
+          defaultMode: 0440
+      - name: clients
+        secret:
+          secretName: core-adapter-clients
+          defaultMode: 0440
+      - name: core-ca
+        configMap:
+          name: core-ca
+      - name: tmp
+        emptyDir:
+          sizeLimit: 256Mi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: core-adapter
+  labels:
+    app.kubernetes.io/name: core-adapter
+    app.kubernetes.io/part-of: nvb-digital
+    nvb.io/component: core-adapter
+  annotations:
+    # OpenShift service CA issues core-adapter-tls for core-adapter.<namespace>.svc (no operator to install).
+    service.beta.openshift.io/serving-cert-secret-name: core-adapter-tls
+spec:
+  selector:
+    nvb.io/component: core-adapter
+  ports:
+  - name: https
+    port: 8443
+    targetPort: https

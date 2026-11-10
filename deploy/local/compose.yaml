@@ -1,0 +1,31 @@
+# Disposable local dependencies for teams WITH podman/docker (`podman compose up -d`).
+# NOT executed by the authors (their workstation has no container engine; they used
+# scripts/local_stack.py). Loopback only; throw-away data; change the example passwords locally
+# via a git-ignored .env file (compose reads it automatically) - never commit real values.
+services:
+  postgres:
+    image: docker.io/library/postgres:16
+    environment:
+      POSTGRES_USER: nvb_local_admin
+      POSTGRES_PASSWORD: ${NVB_LOCAL_PG_ADMIN_PASSWORD:?set in .env}
+    ports: ["127.0.0.1:55432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+  rabbitmq:
+    image: docker.io/library/rabbitmq:3.13-management
+    environment:
+      RABBITMQ_DEFAULT_VHOST: nvb-test
+      RABBITMQ_DEFAULT_USER: nvb_test
+      RABBITMQ_DEFAULT_PASS: ${NVB_LOCAL_RABBITMQ_PASSWORD:?set in .env}
+    ports: ["127.0.0.1:55672:5672"]
+    volumes: [rabbitdata:/var/lib/rabbitmq]
+  objectstore:
+    image: docker.io/chrislusf/seaweedfs:3.97
+    command: ["server", "-dir=/data", "-filer", "-s3", "-s3.port=8333", "-s3.config=/etc/seaweedfs/s3.json"]
+    ports: ["127.0.0.1:18433:8333"]
+    volumes:
+      - weeddata:/data
+      - ./s3.local.json:/etc/seaweedfs/s3.json:ro   # {"identities":[{"name":"t","credentials":[{"accessKey":"…","secretKey":"…"}],"actions":["Admin","Read","Write","List"]}]}
+volumes:
+  pgdata: {}
+  rabbitdata: {}
+  weeddata: {}

@@ -1,0 +1,120 @@
+# One-off initialisation of the DISPOSABLE test dependencies (idempotent; safe to re-run after
+# deleting the finished Job):
+#   1. PostgreSQL: separate databases and separate owner / least-privilege app roles per service,
+#      plus a database for the isolated test core. Passwords come from Secrets (never from argv).
+#   2. Object storage: the private bucket (no public policy is ever set).
+# RabbitMQ needs no init Job: vhost, users and permissions are loaded from the definitions Secret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-deps-init
+  labels: {app.kubernetes.io/part-of: nvb-digital-test-deps}
+data:
+  init.sql: |
+    \set ON_ERROR_STOP on
+    \getenv stm_owner_pw STM_OWNER_PW
+    \getenv stm_app_pw STM_APP_PW
+    \getenv loans_owner_pw LOANS_OWNER_PW
+    \getenv loans_app_pw LOANS_APP_PW
+    \getenv core_pw CORE_PW
+    SELECT format('CREATE ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE', r)
+      FROM unnest(ARRAY['nvb_statements_owner','nvb_statements_app','nvb_loans_owner','nvb_loans_app','nvb_core_test'])
+      AS r WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) \gexec
+    ALTER ROLE nvb_statements_owner PASSWORD :'stm_owner_pw';
+    ALTER ROLE nvb_statements_app PASSWORD :'stm_app_pw';
+    ALTER ROLE nvb_loans_owner PASSWORD :'loans_owner_pw';
+    ALTER ROLE nvb_loans_app PASSWORD :'loans_app_pw';
+    ALTER ROLE nvb_core_test PASSWORD :'core_pw';
+    SELECT format('CREATE DATABASE %I OWNER %I', d, o) FROM (VALUES
+      ('nvb_statements','nvb_statements_owner'), ('nvb_loans','nvb_loans_owner'), ('nvb_core_test','nvb_core_test')) AS t(d, o)
+      WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = d) \gexec
+    REVOKE ALL ON DATABASE nvb_statements, nvb_loans, nvb_core_test FROM PUBLIC;
+    GRANT CONNECT ON DATABASE nvb_statements TO nvb_statements_app;
+    GRANT CONNECT ON DATABASE nvb_loans TO nvb_loans_app;
+    -- Marker required by the guarded test runners before they will touch a database.
+    COMMENT ON DATABASE nvb_core_test IS 'nvb-disposable-test';
+  bucket.py: |
+    import os, sys
+    import boto3
+    from botocore.config import Config
+    s3 = boto3.client("s3", endpoint_url=os.environ["S3_ENDPOINT"], region_name="us-east-1",
+                      aws_access_key_id=open("/var/run/secrets/nvb/s3/access-key").read().strip(),
+                      aws_secret_access_key=open("/var/run/secrets/nvb/s3/secret-key").read().strip(),
+                      config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 10}))
+    bucket = os.environ["S3_BUCKET"]
+    if bucket not in {b["Name"] for b in s3.list_buckets().get("Buckets", [])}:
+        s3.create_bucket(Bucket=bucket)
+    print("bucket ready:", bucket)
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: test-deps-init
+  labels: {app.kubernetes.io/part-of: nvb-digital-test-deps}
+spec:
+  backoffLimit: 4
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: {app.kubernetes.io/part-of: nvb-digital-test-deps, nvb.io/component: test-deps-init}
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      initContainers:
+      - name: postgres-init
+        image: test-postgres
+        command: ["sh", "-c", "psql -X -v ON_ERROR_STOP=1 -h postgres -U postgres -d postgres -f /init/init.sql"]
+        env:
+        - name: PGPASSWORD
+          valueFrom: {secretKeyRef: {name: test-postgres-admin, key: password}}
+        - name: STM_OWNER_PW
+          valueFrom: {secretKeyRef: {name: statements-db-owner, key: password}}
+        - name: STM_APP_PW
+          valueFrom: {secretKeyRef: {name: statements-db-app, key: password}}
+        - name: LOANS_OWNER_PW
+          valueFrom: {secretKeyRef: {name: loans-db-owner, key: password}}
+        - name: LOANS_APP_PW
+          valueFrom: {secretKeyRef: {name: loans-db-app, key: password}}
+        - name: CORE_PW
+          valueFrom: {secretKeyRef: {name: core-test-db, key: password}}
+        resources:
+          requests: {cpu: 25m, memory: 64Mi}
+          limits: {cpu: 250m, memory: 128Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          capabilities: {drop: ["ALL"]}
+          seccompProfile: {type: RuntimeDefault}
+        volumeMounts:
+        - {name: init, mountPath: /init, readOnly: true}
+      containers:
+      - name: bucket-init
+        image: nvb-statements
+        command: ["python", "/init/bucket.py"]
+        env:
+        - {name: S3_ENDPOINT, value: "http://objectstore:8333"}
+        - {name: S3_BUCKET, value: nvb-statements}
+        resources:
+          requests: {cpu: 25m, memory: 96Mi}
+          limits: {cpu: 250m, memory: 192Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          capabilities: {drop: ["ALL"]}
+          seccompProfile: {type: RuntimeDefault}
+        volumeMounts:
+        - {name: init, mountPath: /init, readOnly: true}
+        - {name: s3, mountPath: /var/run/secrets/nvb/s3, readOnly: true}
+        - {name: tmp, mountPath: /tmp}
+      volumes:
+      - name: init
+        configMap: {name: test-deps-init}
+      - name: s3
+        secret: {secretName: statements-s3}
+      - name: tmp
+        emptyDir: {}

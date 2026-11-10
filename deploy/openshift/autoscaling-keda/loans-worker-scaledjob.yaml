@@ -1,0 +1,118 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: loans-worker-manual
+  labels:
+    app.kubernetes.io/part-of: nvb-digital
+spec:
+  pollingInterval: 30
+  minReplicaCount: 0
+  maxReplicaCount: 1        # conservative on a single node; raise only with measurements
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  scalingStrategy:
+    strategy: accurate          # the AMQP scaler reports READY messages only (unacked ones are excluded)
+  jobTargetRef:
+    backoffLimit: 0
+    activeDeadlineSeconds: 1200
+    ttlSecondsAfterFinished: 3600
+    template:
+      metadata:
+        labels:
+          app.kubernetes.io/name: loans-worker
+          app.kubernetes.io/part-of: nvb-digital
+          nvb.io/component: loans-worker
+      spec:
+        serviceAccountName: loans-worker
+        automountServiceAccountToken: false
+        restartPolicy: Never
+        terminationGracePeriodSeconds: 60
+        securityContext:
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+        containers:
+        - name: loans-worker
+          image: nvb-loans
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "nvb_loans.worker", "--drain"]
+          envFrom:
+          - configMapRef:
+              name: loans-config
+          env:
+          - name: LOANS_DATABASE_PASSWORD_FILE
+            value: "/var/run/secrets/nvb/db/password"
+          - name: LOANS_ADAPTER_TOKEN_FILE
+            value: "/var/run/secrets/nvb/adapter/token"
+          - name: LOANS_ADAPTER_CA_FILE
+            value: "/etc/nvb/service-ca/service-ca.crt"
+          - name: LOANS_BROKER_USERNAME_FILE
+            value: "/var/run/secrets/nvb/broker/username"
+          - name: LOANS_BROKER_PASSWORD_FILE
+            value: "/var/run/secrets/nvb/broker/password"
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 384Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+          - name: db
+            mountPath: /var/run/secrets/nvb/db
+            readOnly: true
+          - name: adapter-token
+            mountPath: /var/run/secrets/nvb/adapter
+            readOnly: true
+          - name: broker
+            mountPath: /var/run/secrets/nvb/broker
+            readOnly: true
+          - name: service-ca
+            mountPath: /etc/nvb/service-ca
+            readOnly: true
+          - name: tmp
+            mountPath: /tmp
+        volumes:
+        - name: db
+          secret:
+            secretName: loans-db-app
+            defaultMode: 0440
+        - name: adapter-token
+          secret:
+            secretName: adapter-token-loans-worker
+            defaultMode: 0440
+        - name: broker
+          secret:
+            secretName: loans-broker
+            defaultMode: 0440
+        - name: service-ca
+          configMap:
+            name: nvb-service-ca
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+  triggers:
+  - type: rabbitmq
+    metadata:
+      protocol: amqp
+      mode: QueueLength
+      queueName: nvb.loans.summarize
+      value: "50"            # messages per Job = *_WORKER_MAX_MESSAGES (one bounded run)
+    authenticationRef:
+      name: loans-queue-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: loans-queue-auth
+  labels:
+    app.kubernetes.io/part-of: nvb-digital
+spec:
+  secretTargetRef:
+  - parameter: host            # full amqp(s)://user:password@host:port/vhost for a READ-ONLY monitoring user
+    name: keda-rabbitmq
+    key: host

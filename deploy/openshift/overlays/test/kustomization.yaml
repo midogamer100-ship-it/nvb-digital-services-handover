@@ -1,0 +1,21 @@
+# DISPOSABLE test environment: namespace nvb-digital-test, in-namespace throw-away dependencies and an
+# isolated patched core. Review, then apply step by step following docs/RUNBOOK.md - never
+# `oc apply -k` this blindly on the shared cluster without infra's go-ahead.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: nvb-digital-test
+resources:
+- namespace.yaml
+- ../../base
+- ../../dependencies-test
+- config.yaml
+- networkpolicy-core.yaml
+- core-test.yaml
+components:
+- images
+patches:
+- target: {kind: Route, name: nvb-digital}
+  patch: |-
+    - op: add
+      path: /spec/host
+      value: REPLACE_TEST_PORTAL_HOST

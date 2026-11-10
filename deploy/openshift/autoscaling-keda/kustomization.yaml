@@ -1,0 +1,10 @@
+# OPTIONAL. Apply only after (1) infra confirmed that KEDA / the Custom Metrics Autoscaler operator
+# is installed and serves keda.sh/v1alpha1 ScaledJob + TriggerAuthentication, and (2) the manual
+# worker Jobs passed the functional tests. Nothing here installs KEDA.
+# These ScaledJobs are the ONLY autoscalers of the workers: do not also create an HPA or a second
+# ScaledObject for the same queues.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- statements-worker-scaledjob.yaml
+- loans-worker-scaledjob.yaml

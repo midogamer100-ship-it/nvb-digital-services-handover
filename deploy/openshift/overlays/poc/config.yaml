@@ -1,0 +1,89 @@
+# SHARED PoC values: external, TLS-only dependencies provided by infra. Every REPLACE_* must be set
+# (scripts/validate_manifests.py --strict fails while any remains).
+# Non-secret settings only. Secrets are mounted as files (see ../../secrets/README.md).
+# After changing a ConfigMap: oc -n nvb-digital rollout restart deploy/<name>  (names are stable on purpose,
+# because Jobs/CronJobs/ScaledJobs in sibling kustomizations reference them).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: core-adapter-config
+data:
+  ADAPTER_CORE_BASE_URL: "https://REPLACE_CORE_LB_HOSTNAME"
+  ADAPTER_CORE_CA_FILE: "/etc/nvb/core-ca/ca.crt"
+  # Fleet-wide bound on concurrent core calls = replicas(1) x this value.
+  ADAPTER_CORE_MAX_CONCURRENCY: "4"
+  ADAPTER_CORE_MAX_CONNECTIONS: "4"
+  ADAPTER_CORE_RATE_PER_SECOND: "20"
+  ADAPTER_CORE_RATE_BURST: "20"
+  ADAPTER_ENTRIES_MAX_PAGE_SIZE: "1000"     # must be <= core NVB_INTEGRATION_MAX_PAGE_SIZE
+  ADAPTER_LOG_LEVEL: "INFO"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: statements-config
+data:
+  STATEMENTS_DATABASE_URL: "postgresql+psycopg://nvb_statements_app@REPLACE_POSTGRES_HOST:5432/nvb_statements?sslmode=verify-full&sslrootcert=/etc/nvb/deps-ca/ca.crt"
+  STATEMENTS_ADAPTER_BASE_URL: "https://core-adapter.nvb-digital.svc:8443"
+  STATEMENTS_BROKER_URL: "amqps://REPLACE_RABBITMQ_HOST:5671/nvb"
+  STATEMENTS_S3_ENDPOINT_URL: "https://REPLACE_S3_ENDPOINT"
+  STATEMENTS_S3_BUCKET: "nvb-statements"
+  STATEMENTS_ALLOW_PLAINTEXT_DEPENDENCIES: "false"
+  STATEMENTS_QUEUE_NAME: "nvb.statements.generate"
+  STATEMENTS_BATCH_QUEUE_NAME: "nvb.statements.batch"
+  STATEMENTS_STATEMENT_TIMEZONE: "Africa/Cairo"
+  STATEMENTS_SETTLE_SECONDS: "600"           # must be >= core NVB_INTEGRATION_SETTLE_SECONDS (300)
+  STATEMENTS_ENTRIES_PAGE_SIZE: "1000"       # must be <= ADAPTER_ENTRIES_MAX_PAGE_SIZE
+  STATEMENTS_MAX_ENTRIES_PER_STATEMENT: "200000"   # must be <= core NVB_INTEGRATION_MAX_STATEMENT_ENTRIES
+  STATEMENTS_WORKER_MAX_MESSAGES: "50"       # = KEDA trigger value (messages per Job)
+  STATEMENTS_WORKER_MAX_RUNTIME_SECONDS: "900"
+  STATEMENTS_IDLE_EXIT_SECONDS: "30"
+  STATEMENTS_LEASE_SECONDS: "300"
+  STATEMENTS_BATCH_MAX_ACCOUNTS: "5000"
+  STATEMENTS_LOG_LEVEL: "INFO"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: statements-migration-config
+data:
+  STATEMENTS_MIGRATION_DATABASE_URL: "postgresql+psycopg://nvb_statements_owner@REPLACE_POSTGRES_HOST:5432/nvb_statements?sslmode=verify-full&sslrootcert=/etc/nvb/deps-ca/ca.crt"
+  STATEMENTS_APP_ROLE: "nvb_statements_app"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loans-config
+data:
+  LOANS_DATABASE_URL: "postgresql+psycopg://nvb_loans_app@REPLACE_POSTGRES_HOST:5432/nvb_loans?sslmode=verify-full&sslrootcert=/etc/nvb/deps-ca/ca.crt"
+  LOANS_ADAPTER_BASE_URL: "https://core-adapter.nvb-digital.svc:8443"
+  LOANS_BROKER_URL: "amqps://REPLACE_RABBITMQ_HOST:5671/nvb"
+  LOANS_ALLOW_PLAINTEXT_DEPENDENCIES: "false"
+  LOANS_QUEUE_NAME: "nvb.loans.summarize"
+  LOANS_SUMMARY_TIMEZONE: "Africa/Cairo"
+  LOANS_SETTLE_SECONDS: "600"                # must be >= core NVB_INTEGRATION_SETTLE_SECONDS (300)
+  LOANS_WORKER_MAX_MESSAGES: "50"
+  LOANS_WORKER_MAX_RUNTIME_SECONDS: "600"
+  LOANS_IDLE_EXIT_SECONDS: "30"
+  LOANS_LOG_LEVEL: "INFO"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loans-migration-config
+data:
+  LOANS_MIGRATION_DATABASE_URL: "postgresql+psycopg://nvb_loans_owner@REPLACE_POSTGRES_HOST:5432/nvb_loans?sslmode=verify-full&sslrootcert=/etc/nvb/deps-ca/ca.crt"
+  LOANS_APP_ROLE: "nvb_loans_app"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gateway-config
+data:
+  GATEWAY_PUBLIC_ORIGIN: "https://REPLACE_POC_PORTAL_HOST"          # must equal https://<Route host>
+  GATEWAY_CORE_UPSTREAM: "https://REPLACE_CORE_LB_HOSTNAME"
+  GATEWAY_CORE_CA_FILE: "/etc/nvb/core-ca/ca.crt"
+  GATEWAY_STATEMENTS_UPSTREAM: "https://statements-api.nvb-digital.svc:8443"
+  GATEWAY_LOANS_UPSTREAM: "https://loans-api.nvb-digital.svc:8443"
+  GATEWAY_LOGIN_RATE: "30r/m"
+  GATEWAY_LOGIN_BURST: "20"

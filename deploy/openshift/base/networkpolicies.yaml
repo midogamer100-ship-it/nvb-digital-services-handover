@@ -1,0 +1,217 @@
+# Default deny for every pod of the namespace, then explicit allows per component.
+# Egress to the CORE and to EXTERNAL dependencies (database, broker, object storage) is added by
+# the overlays (ipBlock / in-namespace selectors), because those addresses are environment facts.
+# NetworkPolicy is defence in depth: every hop still authenticates (session cookie -> core,
+# bearer service credentials, database/broker/S3 credentials) and uses TLS.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  labels:
+    app.kubernetes.io/part-of: nvb-digital
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  labels:
+    app.kubernetes.io/part-of: nvb-digital
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: openshift-dns
+    ports:
+    - {protocol: UDP, port: 53}
+    - {protocol: TCP, port: 53}
+    - {protocol: UDP, port: 5353}
+    - {protocol: TCP, port: 5353}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway
+  labels:
+    app.kubernetes.io/part-of: nvb-digital
+spec:
+  podSelector:
+    matchLabels:
+      nvb.io/component: gateway
+  policyTypes: [Ingress, Egress]
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          network.openshift.io/policy-group: ingress
+    ports:
+    - {protocol: TCP, port: 8443}
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          nvb.io/component: statements-api
+    ports:
+    - {protocol: TCP, port: 8443}
+  - to:
+    - podSelector:
+        matchLabels:
+          nvb.io/component: loans-api
+    ports:
+    - {protocol: TCP, port: 8443}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: core-adapter
+  labels:
+    app.kubernetes.io/part-of: nvb-digital
+spec:
+  podSelector:
+    matchLabels:
+      nvb.io/component: core-adapter
+  policyTypes: [Ingress, Egress]
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          nvb.io/component: statements-api
+    - podSelector:
+        matchLabels:
+          nvb.io/component: statements-worker
+    - podSelector:
+        matchLabels:
+          nvb.io/component: statements-ops
+    - podSelector:
+        matchLabels:
+          nvb.io/component: loans-api
+    - podSelector:
+        matchLabels:
+          nvb.io/component: loans-worker
+    ports:
+    - {protocol: TCP, port: 8443}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: statements-api
+  labels:
+    app.kubernetes.io/part-of: nvb-digital
+spec:
+  podSelector:
+    matchLabels:
+      nvb.io/component: statements-api
+  policyTypes: [Ingress, Egress]
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          nvb.io/component: gateway
+    ports:
+    - {protocol: TCP, port: 8443}
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          nvb.io/component: core-adapter
+    ports:
+    - {protocol: TCP, port: 8443}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: statements-worker
+  labels:
+    app.kubernetes.io/part-of: nvb-digital
+spec:
+  podSelector:
+    matchLabels:
+      nvb.io/component: statements-worker
+  policyTypes: [Ingress, Egress]
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          nvb.io/component: core-adapter
+    ports:
+    - {protocol: TCP, port: 8443}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: statements-ops
+  labels:
+    app.kubernetes.io/part-of: nvb-digital
+spec:
+  podSelector:
+    matchLabels:
+      nvb.io/component: statements-ops
+  policyTypes: [Ingress, Egress]
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          nvb.io/component: core-adapter
+    ports:
+    - {protocol: TCP, port: 8443}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: loans-api
+  labels:
+    app.kubernetes.io/part-of: nvb-digital
+spec:
+  podSelector:
+    matchLabels:
+      nvb.io/component: loans-api
+  policyTypes: [Ingress, Egress]
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          nvb.io/component: gateway
+    ports:
+    - {protocol: TCP, port: 8443}
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          nvb.io/component: core-adapter
+    ports:
+    - {protocol: TCP, port: 8443}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: loans-worker
+  labels:
+    app.kubernetes.io/part-of: nvb-digital
+spec:
+  podSelector:
+    matchLabels:
+      nvb.io/component: loans-worker
+  policyTypes: [Ingress, Egress]
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          nvb.io/component: core-adapter
+    ports:
+    - {protocol: TCP, port: 8443}
+---
+# Optional: let the platform monitoring stack scrape /metrics (enable only if infra uses it).
+# apiVersion: networking.k8s.io/v1
+# kind: NetworkPolicy
+# metadata: {name: allow-monitoring}
+# spec:
+#   podSelector: {}
+#   policyTypes: [Ingress]
+#   ingress:
+#   - from: [{namespaceSelector: {matchLabels: {network.openshift.io/policy-group: monitoring}}}]
+#     ports: [{protocol: TCP, port: 8443}]

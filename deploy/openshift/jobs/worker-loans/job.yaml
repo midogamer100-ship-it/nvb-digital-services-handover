@@ -1,0 +1,95 @@
+# Manual worker run (the path to use when KEDA is not installed, and for the first functional test).
+# One Job = one BOUNDED run: at most *_WORKER_MAX_MESSAGES messages or *_WORKER_MAX_RUNTIME_SECONDS,
+# exits 0 when the queues stay empty for *_IDLE_EXIT_SECONDS. Jobs are immutable, so replace the previous one:
+#   oc -n <ns> delete job loans-worker-manual --ignore-not-found
+#   oc -n <ns> apply -k deploy/openshift/overlays/<env>/worker-loans
+# activeDeadlineSeconds > max runtime + one task; terminationGracePeriodSeconds lets the task in hand finish.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: loans-worker-manual
+  labels:
+    app.kubernetes.io/part-of: nvb-digital
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1200
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: loans-worker
+        app.kubernetes.io/part-of: nvb-digital
+        nvb.io/component: loans-worker
+    spec:
+      serviceAccountName: loans-worker
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: loans-worker
+        image: nvb-loans
+        imagePullPolicy: IfNotPresent
+        command: ["python", "-m", "nvb_loans.worker", "--drain"]
+        envFrom:
+        - configMapRef:
+            name: loans-config
+        env:
+        - name: LOANS_DATABASE_PASSWORD_FILE
+          value: "/var/run/secrets/nvb/db/password"
+        - name: LOANS_ADAPTER_TOKEN_FILE
+          value: "/var/run/secrets/nvb/adapter/token"
+        - name: LOANS_ADAPTER_CA_FILE
+          value: "/etc/nvb/service-ca/service-ca.crt"
+        - name: LOANS_BROKER_USERNAME_FILE
+          value: "/var/run/secrets/nvb/broker/username"
+        - name: LOANS_BROKER_PASSWORD_FILE
+          value: "/var/run/secrets/nvb/broker/password"
+        resources:
+          requests: {cpu: 50m, memory: 128Mi}
+          limits: {cpu: 500m, memory: 384Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          capabilities:
+            drop: ["ALL"]
+          seccompProfile:
+            type: RuntimeDefault
+        volumeMounts:
+        - name: db
+          mountPath: /var/run/secrets/nvb/db
+          readOnly: true
+        - name: adapter-token
+          mountPath: /var/run/secrets/nvb/adapter
+          readOnly: true
+        - name: broker
+          mountPath: /var/run/secrets/nvb/broker
+          readOnly: true
+        - name: service-ca
+          mountPath: /etc/nvb/service-ca
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: db
+        secret:
+          secretName: loans-db-app
+          defaultMode: 0440
+      - name: adapter-token
+        secret:
+          secretName: adapter-token-loans-worker
+          defaultMode: 0440
+      - name: broker
+        secret:
+          secretName: loans-broker
+          defaultMode: 0440
+      - name: service-ca
+        configMap:
+          name: nvb-service-ca
+      - name: tmp
+        emptyDir:
+          sizeLimit: 256Mi

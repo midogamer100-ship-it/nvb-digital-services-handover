@@ -1,0 +1,62 @@
+# Egress to things OUTSIDE the namespace. Addresses are environment facts owned by infra: replace
+# every REPLACE_*_CIDR (a /32 per endpoint is preferred). Only the adapter and the gateway may
+# reach the core load balancer; no pod may reach the core DATABASE VM.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-to-core
+spec:
+  podSelector:
+    matchExpressions:
+    - {key: nvb.io/component, operator: In, values: [core-adapter, gateway]}
+  policyTypes: [Egress]
+  egress:
+  - to:
+    - ipBlock: {cidr: REPLACE_CORE_LB_CIDR}
+    ports:
+    - {protocol: TCP, port: 443}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-to-database
+spec:
+  podSelector:
+    matchExpressions:
+    - {key: nvb.io/component, operator: In, values: [statements-api, statements-relay, statements-worker, statements-ops, loans-api, loans-relay, loans-worker, loans-ops]}
+  policyTypes: [Egress]
+  egress:
+  - to:
+    - ipBlock: {cidr: REPLACE_EXTENSION_POSTGRES_CIDR}
+    ports:
+    - {protocol: TCP, port: 5432}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-to-broker
+spec:
+  podSelector:
+    matchExpressions:
+    - {key: nvb.io/component, operator: In, values: [statements-relay, statements-worker, loans-relay, loans-worker]}
+  policyTypes: [Egress]
+  egress:
+  - to:
+    - ipBlock: {cidr: REPLACE_RABBITMQ_CIDR}
+    ports:
+    - {protocol: TCP, port: 5671}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-to-object-storage
+spec:
+  podSelector:
+    matchExpressions:
+    - {key: nvb.io/component, operator: In, values: [statements-api, statements-worker]}
+  policyTypes: [Egress]
+  egress:
+  - to:
+    - ipBlock: {cidr: REPLACE_S3_CIDR}
+    ports:
+    - {protocol: TCP, port: 443}

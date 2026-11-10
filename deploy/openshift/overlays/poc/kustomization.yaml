@@ -1,0 +1,47 @@
+# SHARED PoC environment: namespace nvb-digital. External, TLS-only PostgreSQL / RabbitMQ / S3 provided
+# by infra (retained data - not disposable), the EXISTING core reached through its load balancer
+# with CA + hostname verification. Nothing in bank-poc is modified or reused.
+# Prerequisites that are NOT in this overlay (created by infra / the runbook):
+#   ConfigMap core-ca (key ca.crt)   - CA bundle that signed the core load balancer certificate
+#   ConfigMap deps-ca (key ca.crt)   - CA bundle for PostgreSQL / RabbitMQ / S3 TLS (see config.yaml)
+#   Secrets listed in ../../secrets/README.md
+# Do NOT apply until every REPLACE_* is resolved (scripts/validate_manifests.py --strict) and the
+# separate cutover plan (docs/RUNBOOK.md, step 17) has been approved.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: nvb-digital
+resources:
+- namespace.yaml
+- ../../base
+- config.yaml
+- networkpolicy-external.yaml
+components:
+- images
+patches:
+- target: {kind: Route, name: nvb-digital}
+  patch: |-
+    - op: add
+      path: /spec/host
+      value: REPLACE_POC_PORTAL_HOST
+# TLS to external dependencies: mount the dependency CA bundle and point the clients at it.
+- target: {kind: Deployment, name: "statements-(api|relay)|loans-(api|relay)"}
+  patch: |-
+    - op: add
+      path: /spec/template/spec/volumes/-
+      value: {name: deps-ca, configMap: {name: deps-ca}}
+    - op: add
+      path: /spec/template/spec/containers/0/volumeMounts/-
+      value: {name: deps-ca, mountPath: /etc/nvb/deps-ca, readOnly: true}
+- target: {kind: Deployment, name: "statements-(api|relay)"}
+  patch: |-
+    - op: add
+      path: /spec/template/spec/containers/0/env/-
+      value: {name: STATEMENTS_BROKER_CA_FILE, value: /etc/nvb/deps-ca/ca.crt}
+    - op: add
+      path: /spec/template/spec/containers/0/env/-
+      value: {name: STATEMENTS_S3_CA_FILE, value: /etc/nvb/deps-ca/ca.crt}
+- target: {kind: Deployment, name: loans-relay}
+  patch: |-
+    - op: add
+      path: /spec/template/spec/containers/0/env/-
+      value: {name: LOANS_BROKER_CA_FILE, value: /etc/nvb/deps-ca/ca.crt}

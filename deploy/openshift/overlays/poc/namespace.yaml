@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nvb-digital
+  labels:
+    nvb.io/environment: shared-poc
+  annotations:
+    openshift.io/description: "nvb-digital-services shared PoC. Synthetic data. Separate from bank-poc; reuses none of its resources."

@@ -1,0 +1,137 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: statements-worker-manual
+  labels:
+    app.kubernetes.io/part-of: nvb-digital
+spec:
+  pollingInterval: 30
+  minReplicaCount: 0
+  maxReplicaCount: 2        # conservative on a single node; raise only with measurements
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  scalingStrategy:
+    strategy: accurate          # the AMQP scaler reports READY messages only (unacked ones are excluded)
+  jobTargetRef:
+    backoffLimit: 0
+    activeDeadlineSeconds: 1500
+    ttlSecondsAfterFinished: 3600
+    template:
+      metadata:
+        labels:
+          app.kubernetes.io/name: statements-worker
+          app.kubernetes.io/part-of: nvb-digital
+          nvb.io/component: statements-worker
+      spec:
+        serviceAccountName: statements-worker
+        automountServiceAccountToken: false
+        restartPolicy: Never
+        terminationGracePeriodSeconds: 150
+        securityContext:
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+        containers:
+        - name: statements-worker
+          image: nvb-statements
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "nvb_statements.worker", "--drain"]
+          envFrom:
+          - configMapRef:
+              name: statements-config
+          env:
+          - name: STATEMENTS_DATABASE_PASSWORD_FILE
+            value: "/var/run/secrets/nvb/db/password"
+          - name: STATEMENTS_ADAPTER_TOKEN_FILE
+            value: "/var/run/secrets/nvb/adapter/token"
+          - name: STATEMENTS_ADAPTER_CA_FILE
+            value: "/etc/nvb/service-ca/service-ca.crt"
+          - name: STATEMENTS_BROKER_USERNAME_FILE
+            value: "/var/run/secrets/nvb/broker/username"
+          - name: STATEMENTS_BROKER_PASSWORD_FILE
+            value: "/var/run/secrets/nvb/broker/password"
+          - name: STATEMENTS_S3_ACCESS_KEY_FILE
+            value: "/var/run/secrets/nvb/s3/access-key"
+          - name: STATEMENTS_S3_SECRET_KEY_FILE
+            value: "/var/run/secrets/nvb/s3/secret-key"
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: 1, memory: 768Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+          - name: db
+            mountPath: /var/run/secrets/nvb/db
+            readOnly: true
+          - name: adapter-token
+            mountPath: /var/run/secrets/nvb/adapter
+            readOnly: true
+          - name: broker
+            mountPath: /var/run/secrets/nvb/broker
+            readOnly: true
+          - name: s3
+            mountPath: /var/run/secrets/nvb/s3
+            readOnly: true
+          - name: service-ca
+            mountPath: /etc/nvb/service-ca
+            readOnly: true
+          - name: tmp
+            mountPath: /tmp
+        volumes:
+        - name: db
+          secret:
+            secretName: statements-db-app
+            defaultMode: 0440
+        - name: adapter-token
+          secret:
+            secretName: adapter-token-statements-worker
+            defaultMode: 0440
+        - name: broker
+          secret:
+            secretName: statements-broker
+            defaultMode: 0440
+        - name: s3
+          secret:
+            secretName: statements-s3
+            defaultMode: 0440
+        - name: service-ca
+          configMap:
+            name: nvb-service-ca
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+  triggers:
+  - type: rabbitmq
+    metadata:
+      protocol: amqp
+      mode: QueueLength
+      queueName: nvb.statements.generate
+      value: "50"            # messages per Job = *_WORKER_MAX_MESSAGES (one bounded run)
+    authenticationRef:
+      name: statements-queue-auth
+  - type: rabbitmq
+    metadata:
+      protocol: amqp
+      mode: QueueLength
+      queueName: nvb.statements.batch
+      value: "50"            # messages per Job = *_WORKER_MAX_MESSAGES (one bounded run)
+    authenticationRef:
+      name: statements-queue-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: statements-queue-auth
+  labels:
+    app.kubernetes.io/part-of: nvb-digital
+spec:
+  secretTargetRef:
+  - parameter: host            # full amqp(s)://user:password@host:port/vhost for a READ-ONLY monitoring user
+    name: keda-rabbitmq
+    key: host

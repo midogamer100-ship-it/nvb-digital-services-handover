@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nvb-digital-test
+  labels:
+    nvb.io/environment: disposable-test
+  annotations:
+    openshift.io/description: "DISPOSABLE test namespace for nvb-digital-services. Synthetic data only. Not bank-poc."

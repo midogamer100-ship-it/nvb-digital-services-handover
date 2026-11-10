@@ -1,0 +1,61 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: loans-migrate
+  labels:
+    app.kubernetes.io/part-of: nvb-digital
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: loans-ops
+        app.kubernetes.io/part-of: nvb-digital
+        nvb.io/component: loans-ops
+    spec:
+      serviceAccountName: loans-ops
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: loans-ops
+        image: nvb-loans
+        imagePullPolicy: IfNotPresent
+        command: ["alembic", "-c", "/opt/app/migrations/loans/alembic.ini", "upgrade", "head"]
+        envFrom:
+        - configMapRef:
+            name: loans-migration-config
+        env:
+        - name: LOANS_MIGRATION_PASSWORD_FILE
+          value: "/var/run/secrets/nvb/db/password"
+        resources:
+          requests: {cpu: 50m, memory: 128Mi}
+          limits: {cpu: 500m, memory: 256Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          capabilities:
+            drop: ["ALL"]
+          seccompProfile:
+            type: RuntimeDefault
+        volumeMounts:
+        - name: db
+          mountPath: /var/run/secrets/nvb/db
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: db
+        secret:
+          secretName: loans-db-owner
+          defaultMode: 0440
+      - name: tmp
+        emptyDir:
+          sizeLimit: 256Mi
