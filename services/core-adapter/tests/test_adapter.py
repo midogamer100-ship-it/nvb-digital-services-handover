@@ -16,7 +16,7 @@ ACCOUNT = {"account_id": 7, "masked_number": "•••• 1234", "type": "curre
 
 
 def manifest_body(**over):
-    body = {"dataset_version": "statement-v1", "dataset_id": "a" * 64, "account_id": 7,
+    body = {"dataset_version": "statement-v2", "dataset_id": "a" * 64, "entries_sha256": "b" * 64, "account_id": 7,
             "period_start": "2026-08-31T21:00:00+00:00", "period_end": "2026-09-30T21:00:00+00:00",
             "boundary": "[start,end) UTC", "ordering": "posted_at ASC, id ASC", "currency": "EGP",
             "opening_balance_minor": 1000, "closing_balance_minor": 1500, "credit_total_minor": 700,
@@ -178,7 +178,7 @@ async def test_core_connection_error_maps_to_503(settings_factory, tokens):
 
 
 @pytest.mark.parametrize("bad", [{"opening_balance_minor": 10.5}, {"opening_balance_minor": "1000"},
-                                 {"dataset_version": "statement-v2"}, {"boundary": "[start,end] local"}])
+                                 {"dataset_version": "statement-v1"}, {"entries_sha256": "short"}, {"boundary": "[start,end] local"}])
 async def test_contract_violation_fails_closed(settings_factory, tokens, bad):
     async with adapter_client(settings_factory(), lambda r: httpx.Response(200, json=manifest_body(**bad))) as c:
         resp = await c.get("/v1/statement-datasets/7/manifest", headers=auth(tokens["statements"]), params=PERIOD)

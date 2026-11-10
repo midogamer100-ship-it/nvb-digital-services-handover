@@ -14,6 +14,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 CONTRACT_VERSION = "core-adapter-v1"
+DATASET_VERSION = "statement-v2"
 
 
 class _Model(BaseModel):
@@ -60,8 +61,10 @@ class SubjectAccounts(_Model):
 
 
 class StatementManifest(_Model):
-    dataset_version: Literal["statement-v1"]
+    dataset_version: Literal["statement-v2"]
     dataset_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    # SHA-256 over the canonical encoding of every entry of the period (core snapshot).
+    entries_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     account_id: StrictInt
     period_start: datetime
     period_end: datetime
@@ -84,6 +87,8 @@ class StatementManifest(_Model):
 class StatementEntry(_Model):
     entry_id: StrictInt
     posted_at: datetime
+    # Integer microseconds since the Unix epoch: the value hashed into entries_sha256.
+    posted_at_us: StrictInt
     reference: str
     direction: Literal["debit", "credit"]
     type: str

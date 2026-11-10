@@ -7,6 +7,7 @@ import json
 import secrets
 from datetime import UTC, datetime, timedelta
 
+from nvb_platform.dataset import entries_digest, micros
 from nvb_statements.adapter_client import AdapterCallError, Identity
 
 
@@ -24,6 +25,9 @@ class FakeAdapter:
         self.unavailable = False
         self.fail_manifest = 0
         self.mutate_after_first_page = False
+        self.tamper_after_first_page = False   # edit a row in place: same count and totals
+        self.discovery_fail_after: int | None = None
+        self.load_test_accounts: set[int] = set()
         self.calls: list[str] = []
         self._next_id = 1
 
@@ -52,7 +56,7 @@ class FakeAdapter:
         if self.unavailable:
             raise AdapterCallError(503, "core_unavailable", "down", True)
 
-    def resolve(self, session_token, csrf_token, request_id):
+    def resolve(self, session_token, csrf_token, request_id, include_accounts=True):
         self.calls.append("resolve")
         self._check()
         s = self.sessions.get(session_token)
@@ -79,9 +83,10 @@ class FakeAdapter:
         opening = sum(signed(e) for e in rows if e["posted_at"] < start)
         credits = sum(e["amount_minor"] for e in period if e["direction"] == "credit")
         debits = sum(e["amount_minor"] for e in period if e["direction"] == "debit")
+        digest = entries_digest([self._entry_out(e) for e in period])
         core = {"account_id": account_id, "start": start.isoformat(), "end": end.isoformat(), "o": opening,
-                "c": credits, "d": debits, "n": len(period), "ids": [e["entry_id"] for e in period]}
-        return {"dataset_version": "statement-v1",
+                "c": credits, "d": debits, "n": len(period), "h": digest}
+        return {"dataset_version": "statement-v2", "entries_sha256": digest,
                 "dataset_id": hashlib.sha256(json.dumps(core, sort_keys=True).encode()).hexdigest(),
                 "account_id": account_id, "period_start": start.astimezone(UTC).isoformat(),
                 "period_end": end.astimezone(UTC).isoformat(), "boundary": "[start,end) UTC",
@@ -100,11 +105,33 @@ class FakeAdapter:
         _rows, period = self._rows(account_id, subject, start, end)
         offset = int(cursor or 0)
         chunk = period[offset:offset + limit]
+        items = [self._entry_out(e) for e in chunk]
         if self.mutate_after_first_page and offset == 0:
             self.mutate_after_first_page = False
             self.post(account_id, start + timedelta(seconds=1), "credit", 5, "late posting")
+        if self.tamper_after_first_page and offset == 0:
+            self.tamper_after_first_page = False
+            period[-1]["description"] = "edited in place"
         has_more = offset + limit < len(period)
-        items = [{**e, "posted_at": e["posted_at"].isoformat(),
-                  "signed_amount_minor": e["amount_minor"] if e["direction"] == "credit" else -e["amount_minor"],
-                  "balance_after_minor": 0} for e in chunk]
         return {"items": items, "has_more": has_more, "next_cursor": str(offset + limit) if has_more else None}
+
+    @staticmethod
+    def _entry_out(e: dict) -> dict:
+        return {**e, "posted_at": e["posted_at"].isoformat(), "posted_at_us": micros(e["posted_at"]),
+                "signed_amount_minor": e["amount_minor"] if e["direction"] == "credit" else -e["amount_minor"],
+                "balance_after_minor": 0}
+
+    def discovery(self, after_account_id, limit, request_id=None, include_load_test=False):
+        self.calls.append("discovery")
+        self._check()
+        if self.discovery_fail_after is not None:
+            if self.discovery_fail_after <= 0:
+                self.discovery_fail_after = None
+                raise AdapterCallError(503, "core_unavailable", "down", True)
+            self.discovery_fail_after -= 1
+        ids = sorted(a for a in self.accounts if a > after_account_id
+                     and (include_load_test or a not in self.load_test_accounts))
+        chunk = ids[:limit]
+        has_more = len(ids) > limit
+        return {"items": [{**self.accounts[a], "subject": self.owners[a]} for a in chunk], "has_more": has_more,
+                "next_after_account_id": chunk[-1] if has_more else None}

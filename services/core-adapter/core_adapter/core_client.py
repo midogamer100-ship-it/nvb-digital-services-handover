@@ -87,6 +87,8 @@ CORE_ERROR_MAP = {
     "naive_datetime": (422, "invalid_period", False),
     "invalid_cursor": (422, "invalid_cursor", False),
     "ledger_reconciliation_failed": (502, "core_integrity_error", False),
+    "snapshot_inconsistent": (502, "core_integrity_error", False),
+    "dataset_too_large": (422, "too_large", False),
 }
 
 

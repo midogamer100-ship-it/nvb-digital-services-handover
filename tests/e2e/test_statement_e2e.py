@@ -34,9 +34,10 @@ def _d(t: str) -> str:
 @pytest.fixture
 def stack(tmp_path, monkeypatch):
     for k in list(os.environ):
-        if k.upper().startswith(("NVB_", "ADAPTER_", "STATEMENTS_")):
+        if k.upper().startswith(("NVB_", "ADAPTER_", "STATEMENTS_", "LOANS_", "KUBERNETES_")):
             monkeypatch.delenv(k)
-    for p in (CORE_DIR, str(REPO / "services" / "core-adapter"), str(REPO / "services" / "statements")):
+    for p in (CORE_DIR, str(REPO / "services" / "core-adapter"), str(REPO / "services" / "statements"),
+              str(REPO / "libs" / "nvb_platform")):
         monkeypatch.syspath_prepend(p)
 
     from fastapi.testclient import TestClient
@@ -83,7 +84,8 @@ def stack(tmp_path, monkeypatch):
 
     (tmp_path / "api-token").write_text(api_tok)
     (tmp_path / "worker-token").write_text(worker_tok)
-    st = StatementsSettings(database_url=f"sqlite:///{tmp_path / 'statements.db'}", settle_seconds=600,
+    st = StatementsSettings(database_url=f"sqlite:///{tmp_path / 'statements.db'}", allow_sqlite=True,
+                            settle_seconds=600,
                             adapter_base_url="http://adapter.inprocess", log_level="WARNING")
     engine = build_engine(st)
     Base.metadata.create_all(engine)

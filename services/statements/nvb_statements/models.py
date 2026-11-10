@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from sqlalchemy import (
     JSON,
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     Index,
@@ -25,8 +26,15 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from nvb_platform.roles import RoleAssignmentMixin, RoleEventMixin
+
 STATUSES = ("queued", "running", "completed", "failed", "cancelled")
 TERMINAL = {"completed", "failed", "cancelled"}
+BATCH_STATUSES = ("freezing", "releasing", "running", "completed", "completed_with_failures", "cancelled",
+                  "failed")
+BATCH_TERMINAL = {"completed", "completed_with_failures", "cancelled", "failed"}
+# Extension roles known to THIS service. Core roles (customer/admin/demo) grant none of them.
+KNOWN_ROLES = frozenset({"batch_operator", "extension_admin"})
 BigIntPK = BigInteger().with_variant(Integer, "sqlite")
 
 
@@ -60,7 +68,9 @@ class StatementRequest(Base):
     period_timezone: Mapped[str] = mapped_column(String(40), nullable=False)
     period_start_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     period_end_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    dataset_version: Mapped[str] = mapped_column(String(20), nullable=False, default="statement-v1")
+    dataset_version: Mapped[str] = mapped_column(String(20), nullable=False, default="statement-v2")
+    # Broker queue this request is (re-)published to: interactive or batch.
+    queue: Mapped[str] = mapped_column(String(80), nullable=False, default="nvb.statements.generate")
     dataset_id: Mapped[str | None] = mapped_column(String(64))
     entry_count: Mapped[int | None] = mapped_column(Integer)
 
@@ -112,3 +122,70 @@ class OutboxMessage(Base):
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     publish_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_error: Mapped[str | None] = mapped_column(String(200))
+
+
+class StatementBatch(Base):
+    r"""One batch run (e.g. monthly statements for every eligible account).
+
+    ::
+
+        freezing --discovery complete--> releasing --all members enqueued--> running
+        running --all members terminal--> completed | completed_with_failures
+        any non-terminal --operator cancel--> cancelled ;  freezing --over the cap--> failed
+
+    ``freezing`` builds the frozen member manifest (``batch_items``) from the authorised
+    discovery of the core, resumably (``discovery_cursor``). Nothing is processed before the
+    manifest is complete. Manual (API) and scheduled (CronJob) creation call the same function.
+    """
+
+    __tablename__ = "statement_batches"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_batch_idempotency"),
+        CheckConstraint("status IN ('freezing','releasing','running','completed','completed_with_failures',"
+                        "'cancelled','failed')", name="ck_batch_status"),
+        CheckConstraint("trigger_kind IN ('manual','schedule')", name="ck_batch_trigger"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, default="monthly_statements")
+    period_label: Mapped[str] = mapped_column(String(7), nullable=False)
+    period_timezone: Mapped[str] = mapped_column(String(40), nullable=False)
+    period_start_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    period_end_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="freezing")
+    trigger_kind: Mapped[str] = mapped_column(String(10), nullable=False)
+    created_by: Mapped[str] = mapped_column(String(80), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    include_load_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    discovery_cursor: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    total_items: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    released_items: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    retry_rounds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_code: Mapped[str | None] = mapped_column(String(40))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    frozen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class BatchItem(Base):
+    """Frozen manifest member: one (subject, account) captured at freeze time."""
+
+    __tablename__ = "batch_items"
+    __table_args__ = (UniqueConstraint("batch_id", "account_id", name="uq_batch_item_account"),
+                      Index("ix_batch_item_unreleased", "batch_id", "request_id"))
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    batch_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    owner_subject: Mapped[str] = mapped_column(String(64), nullable=False)
+    account_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    account_masked: Mapped[str] = mapped_column(String(16), nullable=False)
+    request_id: Mapped[str | None] = mapped_column(String(36))
+
+
+class RoleAssignment(RoleAssignmentMixin, Base):
+    pass
+
+
+class RoleEvent(RoleEventMixin, Base):
+    pass

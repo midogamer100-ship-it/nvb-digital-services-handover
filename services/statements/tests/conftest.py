@@ -24,13 +24,14 @@ SEPT_END = datetime(2026, 9, 30, 21, 0, tzinfo=UTC)     # 2026-10-01 00:00 Afric
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
     for k in list(os.environ):
-        if k.upper().startswith(("STATEMENTS_", "NVB_")):
+        if k.upper().startswith(("STATEMENTS_", "NVB_", "ADAPTER_", "LOANS_", "KUBERNETES_")):
             monkeypatch.delenv(k)
 
 
 @pytest.fixture
 def settings(tmp_path):
-    return Settings(database_url=f"sqlite:///{tmp_path / 'statements.db'}", settle_seconds=0, log_level="WARNING",
+    return Settings(database_url=f"sqlite:///{tmp_path / 'statements.db'}", allow_sqlite=True, settle_seconds=0,
+                    log_level="WARNING",
                     retry_base_seconds=0, retry_max_seconds=0, max_attempts=3, entries_page_size=50,
                     idle_exit_seconds=0, lease_seconds=60)
 
