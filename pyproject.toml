@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+testpaths = ["tests/contract", "tests/e2e"]
+addopts = "-q -p no:cacheprovider --import-mode=importlib"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = ["ignore::DeprecationWarning"]

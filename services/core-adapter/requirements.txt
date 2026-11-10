@@ -1,0 +1,8 @@
+# Pinned runtime dependencies (Python 3.12). Kept aligned with the core's pins where shared.
+fastapi==0.115.12
+starlette==0.46.2
+uvicorn[standard]==0.34.2
+pydantic==2.11.5
+pydantic-settings==2.9.1
+httpx==0.28.1
+prometheus-client==0.22.0

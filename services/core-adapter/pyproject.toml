@@ -1,0 +1,11 @@
+[project]
+name = "nvb-core-adapter"
+version = "0.1.0"
+description = "NVB extension Core Adapter (synthetic demo data only)"
+requires-python = ">=3.12,<3.13"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -p no:cacheprovider"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
