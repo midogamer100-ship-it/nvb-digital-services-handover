@@ -163,19 +163,9 @@ http {
 @@CORE_TLS_DIRECTIVES@@
             proxy_pass @@CORE_UPSTREAM@@;
         }
-        location ^~ /api/ { return 404; }
+@@BANK_API_LOCATION@@
 
         # ---- portal (static single-page app) --------------------------------------------------------
-        location / {
-            limit_except GET { deny all; }
-            root @@PORTAL_ROOT@@;
-            add_header Cache-Control "no-cache" always;
-            add_header X-Content-Type-Options "nosniff" always;
-            add_header X-Frame-Options "DENY" always;
-            add_header Referrer-Policy "no-referrer" always;
-            add_header Content-Security-Policy "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'" always;
-            add_header Strict-Transport-Security "max-age=31536000" always;
-            try_files $uri /index.html;
-        }
+@@BANK_ROOT_LOCATION@@
     }
 }
