@@ -130,7 +130,7 @@ def main() -> int:
     args = p.parse_args()
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(render(dict(os.environ)), encoding="utf-8", newline="\n")
+    out.write_bytes(render(dict(os.environ)).encode("utf-8"))
     for sub in ("client_body", "proxy", "fastcgi", "uwsgi", "scgi"):
         (Path(os.environ["GATEWAY_RUN_DIR"]) / sub).mkdir(parents=True, exist_ok=True)
     print(f"gateway configuration written to {out}", file=sys.stderr)
