@@ -24,6 +24,7 @@ http {
     include       @@MIME_TYPES@@;
     default_type  application/octet-stream;
     server_tokens off;
+    map_hash_bucket_size 128;
 
     # No request bodies, cookies, Authorization headers or query strings in the access log.
     log_format gw '$time_iso8601 rid=$request_id $remote_addr "$request_method $uri" $status '

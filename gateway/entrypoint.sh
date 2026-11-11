@@ -3,5 +3,5 @@
 # in the foreground. SIGQUIT (STOPSIGNAL) = graceful shutdown: in-flight requests finish.
 set -eu
 python3 /opt/gateway/render_config.py --output "${GATEWAY_RUN_DIR}/nginx.conf"
-nginx -t -c "${GATEWAY_RUN_DIR}/nginx.conf" -g "daemon off;"
-exec nginx -c "${GATEWAY_RUN_DIR}/nginx.conf" -g "daemon off;"
+nginx -e stderr -t -c "${GATEWAY_RUN_DIR}/nginx.conf" -g "daemon off;"
+exec nginx -e stderr -c "${GATEWAY_RUN_DIR}/nginx.conf" -g "daemon off;"
