@@ -134,12 +134,12 @@ http {
         # ---- extension APIs ---------------------------------------------------------------------
         location ^~ /x/statements/ {
             if ($reject_origin) { return 403; }
-@@INTERNAL_TLS_DIRECTIVES@@
+@@STATEMENTS_TLS_DIRECTIVES@@
             proxy_pass @@STATEMENTS_UPSTREAM@@;
         }
         location ^~ /x/loans/ {
             if ($reject_origin) { return 403; }
-@@INTERNAL_TLS_DIRECTIVES@@
+@@LOANS_TLS_DIRECTIVES@@
             proxy_pass @@LOANS_UPSTREAM@@;
         }
         location ^~ /x/ { return 404; }

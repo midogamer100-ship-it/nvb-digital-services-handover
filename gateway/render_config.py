@@ -109,7 +109,7 @@ def render(env: dict) -> str:
         "LISTEN": listen,
         "TLS_SERVER_DIRECTIVES": tls_server,
         "CORE_UPSTREAM": core, "CORE_TLS_DIRECTIVES": core_tls,
-        "STATEMENTS_UPSTREAM": stm, "LOANS_UPSTREAM": loans, "INTERNAL_TLS_DIRECTIVES": stm_tls,
+        "STATEMENTS_UPSTREAM": stm, "LOANS_UPSTREAM": loans, "STATEMENTS_TLS_DIRECTIVES": stm_tls, "LOANS_TLS_DIRECTIVES": loans_tls,
         "PORTAL_ROOT": _path(_need(env, "GATEWAY_PORTAL_ROOT")),
     }
     for name in ("WORKER_PROCESSES", "LOGIN_RATE", "LOGIN_BURST"):
