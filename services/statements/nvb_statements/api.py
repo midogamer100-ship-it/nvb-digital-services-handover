@@ -25,7 +25,7 @@ from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select, text, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.orm import Session
 
 from nvb_platform import roles as roles_lib
@@ -37,6 +37,7 @@ from nvb_statements.db import as_utc, build_engine, build_sessionmaker
 from nvb_statements.logging_setup import configure_logging, request_id_var
 from nvb_statements.models import (
     KNOWN_ROLES,
+    STATUSES,
     RoleAssignment,
     RoleEvent,
     StatementBatch,
@@ -172,9 +173,13 @@ def create_app(settings: Settings | None = None, *, adapter: AdapterClient | Non
             raise ServiceError(403, "customer_only", "Customer access only.")
         return ident
 
+    def effective(db: Session, ident: Identity) -> frozenset[str]:
+        # operations_admin counts only for a core admin (trusted introspection), see nvb_platform.roles.
+        return roles_lib.effective_roles(roles_lib.active_roles(db, RoleAssignment, ident.subject), ident.role)
+
     def staff(*required: str):
         def dep(ident: Identity = Depends(session_identity), db: Session = Depends(get_db)) -> Identity:
-            held = roles_lib.active_roles(db, RoleAssignment, ident.subject)
+            held = effective(db, ident)
             db.rollback()  # end the authorization read transaction before the endpoint runs
             if not held.intersection(required):
                 # Same answer whether the role exists or not; nothing is inferred from the core role.
@@ -184,6 +189,7 @@ def create_app(settings: Settings | None = None, *, adapter: AdapterClient | Non
 
     batch_operator = staff("batch_operator")
     extension_admin = staff("extension_admin")
+    operations_admin = staff("operations_admin")
 
     def _owned_request(db: Session, ident: Identity, request_id: str) -> StatementRequest:
         r = db.get(StatementRequest, request_id) if len(request_id) <= 36 else None
@@ -222,9 +228,14 @@ def create_app(settings: Settings | None = None, *, adapter: AdapterClient | Non
     @app.get(f"{PREFIX}/me")
     def me(ident: Identity = Depends(session_identity), db: Session = Depends(get_db)):
         """Who the core says the caller is, plus the caller's extension roles in this service."""
+        held = effective(db, ident)
         return {"subject": ident.subject, "username": ident.username, "display_name": ident.display_name,
                 "core_role": ident.role,
-                "extension_roles": sorted(roles_lib.active_roles(db, RoleAssignment, ident.subject))}
+                "extension_roles": sorted(roles_lib.active_roles(db, RoleAssignment, ident.subject)),
+                "effective_roles": sorted(held),
+                "capabilities": {"statement_operations": "operations_admin" in held,
+                                 "batch_operations": "batch_operator" in held,
+                                 "role_admin": "extension_admin" in held}}
 
     @app.get(f"{PREFIX}/accounts")
     def accounts(ident: Identity = Depends(customer)):
@@ -300,6 +311,42 @@ def create_app(settings: Settings | None = None, *, adapter: AdapterClient | Non
         return Response(data, media_type="application/pdf", headers={
             "Content-Disposition": f'attachment; filename="{filename}"', "Cache-Control": "no-store",
             "X-Content-Type-Options": "nosniff"})
+
+    # --- Staff: statement operations view (role operations_admin, read-only) -----------------
+    # No owner subject, no internal error message, no storage key and no document link: an
+    # administrator sees processing state, not customers' documents (download stays customer-only).
+
+    def _ops_item(r: StatementRequest) -> dict:
+        return {"id": r.id, "period": r.period_label, "account_masked": r.account_masked, "purpose": r.purpose,
+                "status": r.status, "error_code": r.error_code if r.status == "failed" else None,
+                "attempts": r.attempts, "created_at": as_utc(r.created_at).isoformat(),
+                "completed_at": as_utc(r.completed_at).isoformat() if r.completed_at else None}
+
+    @app.get(f"{PREFIX}/ops/summary")
+    def ops_summary(_i: Identity = Depends(operations_admin), db: Session = Depends(get_db)):
+        by_status = dict(db.execute(select(StatementRequest.status, func.count()).group_by(StatementRequest.status)).all())
+        by_purpose = dict(db.execute(select(StatementRequest.purpose, func.count())
+                                     .group_by(StatementRequest.purpose)).all())
+        failures = db.scalars(select(StatementRequest).where(StatementRequest.status == "failed")
+                              .order_by(StatementRequest.updated_at.desc(), StatementRequest.id).limit(20)).all()
+        batches = db.scalars(select(StatementBatch).order_by(StatementBatch.created_at.desc()).limit(10)).all()
+        return {"by_status": {s: int(by_status.get(s, 0)) for s in STATUSES},
+                "by_purpose": {p: int(by_purpose.get(p, 0)) for p in ("customer_request", "batch")},
+                "recent_failures": [_ops_item(r) for r in failures],
+                "batches": [batch_ops.batch_out(db, b) for b in batches]}
+
+    @app.get(f"{PREFIX}/ops/requests")
+    def ops_requests(_i: Identity = Depends(operations_admin),
+                     status: str | None = Query(default=None, pattern=r"^(queued|running|completed|failed|cancelled)$"),
+                     purpose: str | None = Query(default=None, pattern=r"^(customer_request|batch)$"),
+                     limit: int = Query(default=50, ge=1, le=100), db: Session = Depends(get_db)):
+        stmt = select(StatementRequest)
+        if status:
+            stmt = stmt.where(StatementRequest.status == status)
+        if purpose:
+            stmt = stmt.where(StatementRequest.purpose == purpose)
+        rows = db.scalars(stmt.order_by(StatementRequest.created_at.desc(), StatementRequest.id).limit(limit)).all()
+        return {"items": [_ops_item(r) for r in rows]}
 
     # --- Staff: batches (role batch_operator) --------------------------------------------------
 

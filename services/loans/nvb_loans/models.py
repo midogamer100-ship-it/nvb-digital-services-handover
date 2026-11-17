@@ -2,8 +2,11 @@ r"""Loans extension schema (own database; no foreign keys into core tables).
 
 Application workflow (``loan_applications.status``)::
 
-    draft --customer submit--> submitted --assign reviewer--> under_review
-    under_review --approver decision--> approved | rejected
+    draft --customer submit--> submitted --operations admin starts review--> under_review
+    under_review --review recommendation, then final decision--> approved | rejected
+
+While ``LOANS_LEGACY_REVIEWER_WORKFLOW_ENABLED=true`` the retired path still works: an approver
+assigns a reviewer, the reviewer recommends, a different approver decides.
 
 "approved" is a WORKFLOW decision only. Nothing here posts money, calls a core deposit or
 creates a financial loan record. Money values are integer minor units.
@@ -20,7 +23,8 @@ from nvb_platform.roles import RoleAssignmentMixin, RoleEventMixin
 
 STATUSES = ("draft", "submitted", "under_review", "approved", "rejected")
 OPEN_FOR_REVIEW = ("submitted", "under_review")
-KNOWN_ROLES = frozenset({"reviewer", "approver", "batch_operator", "extension_admin"})
+# reviewer/approver are retired (kept for history, rollback and the transition command).
+KNOWN_ROLES = frozenset({"operations_admin", "reviewer", "approver", "batch_operator", "extension_admin"})
 TASK_TERMINAL = {"completed", "failed"}
 BigIntPK = BigInteger().with_variant(Integer, "sqlite")
 TS = DateTime(timezone=True)

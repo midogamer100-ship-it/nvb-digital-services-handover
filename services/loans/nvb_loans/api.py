@@ -4,12 +4,15 @@ Identity comes from the core session cookie verified through the Core Adapter on
 (see nvb_platform.webauth). Staff capabilities are explicit extension role assignments in THIS
 service's database, bound to the caller's stable subject:
 
-* customer        - own applications only (core role ``customer``; ownership by subject).
-* reviewer        - applications ASSIGNED to them; writes a recommendation.
-* approver        - assigns reviewers and takes the final decision. Never the reviewer who
-                    recommended, never the applicant.
-* batch_operator  - summary refresh batches.
-* extension_admin - role administration and reviewer assignment.
+* customer         - own applications only (core role ``customer``; ownership by subject).
+* operations_admin - the loan desk: sees the review queue, starts the review, records the review
+                     recommendation and takes the final decision. Effective ONLY for a core
+                     ``admin`` (trusted introspection) holding an explicit assignment. Never on
+                     their own application. One person may recommend and decide (PoC choice).
+* batch_operator   - summary refresh batches.
+* extension_admin  - role administration.
+* reviewer / approver - RETIRED. Effective only while LOANS_LEGACY_REVIEWER_WORKFLOW_ENABLED=true
+                     (rollback switch); otherwise their rows are history only.
 
 Core admins/demo users get nothing automatically. "approved" is a workflow state: this service
 has no code path that posts money or calls any core write API.
@@ -28,7 +31,7 @@ from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
-from sqlalchemy import or_, select, text
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from nvb_loans import service as svc
@@ -193,21 +196,44 @@ def create_app(settings: Settings | None = None, *, adapter: AdapterClient | Non
         def has(self, *names: str) -> bool:
             return bool(self.roles.intersection(names))
 
+    legacy = settings.legacy_reviewer_workflow_enabled
+
+    def effective(db: Session, ident: Identity) -> frozenset[str]:
+        """Authorizing roles: explicit rows, filtered by the trusted core role and the legacy switch."""
+        return roles_lib.effective_roles(roles_lib.active_roles(db, RoleAssignment, ident.subject), ident.role,
+                                         legacy_roles=roles_lib.LEGACY_REVIEW_ROLES, legacy_enabled=legacy)
+
     def staff(*required: str):
         def dep(ident: Identity = Depends(session_identity), db: Session = Depends(get_db)) -> Staff:
-            held = roles_lib.active_roles(db, RoleAssignment, ident.subject)
+            held = effective(db, ident)
             db.rollback()
             if not held.intersection(required):
                 raise ServiceError(403, "forbidden", "You are not permitted to perform this operation.")
             return Staff(ident, held)
         return dep
 
-    any_reviewer = staff("reviewer", "approver", "extension_admin")
+    STAFF_VIEW = ("operations_admin", "approver", "extension_admin")   # see every reviewable application
+    any_reviewer = staff("operations_admin", "reviewer", "approver", "extension_admin")
     assigner = staff("approver", "extension_admin")
-    reviewer = staff("reviewer")
-    approver = staff("approver")
+    recommender = staff("operations_admin", "reviewer")
+    decider = staff("operations_admin", "approver")
+    operations_admin = staff("operations_admin")
     batch_operator = staff("batch_operator")
     extension_admin = staff("extension_admin")
+
+    def retired_workflow() -> None:
+        if not legacy:
+            raise ServiceError(410, "reviewer_workflow_retired",
+                               "The separate reviewer workflow is retired; the Operations Admin reviews applications.")
+
+    def _admin_subjects():
+        return select(RoleAssignment.subject).where(RoleAssignment.role == roles_lib.OPERATIONS_ADMIN,
+                                                    RoleAssignment.active.is_(True))
+
+    def _held_by_retired_reviewer():
+        """Open, unrecommended applications assigned to someone who is not an Operations Admin."""
+        return and_(LoanApplication.status == "under_review", LoanApplication.recommendation.is_(None),
+                    LoanApplication.reviewer_subject.is_not(None))
 
     def _owned(db: Session, ident: Identity, app_id: str) -> LoanApplication:
         a = db.get(LoanApplication, app_id) if len(app_id) <= 36 else None
@@ -220,7 +246,7 @@ def create_app(settings: Settings | None = None, *, adapter: AdapterClient | Non
         a = db.get(LoanApplication, app_id) if len(app_id) <= 36 else None
         if a is None or a.status == "draft":
             raise ServiceError(404, "not_found", "Application not found.")
-        if not who.has("approver", "extension_admin") and a.reviewer_subject != who.subject:
+        if not who.has(*STAFF_VIEW) and a.reviewer_subject != who.subject:
             raise ServiceError(404, "not_found", "Application not found.")
         return a
 
@@ -258,9 +284,15 @@ def create_app(settings: Settings | None = None, *, adapter: AdapterClient | Non
 
     @app.get(f"{PREFIX}/me")
     def me(ident: Identity = Depends(session_identity), db: Session = Depends(get_db)):
+        held = effective(db, ident)
         return {"subject": ident.subject, "username": ident.username, "display_name": ident.display_name,
                 "core_role": ident.role,
-                "extension_roles": sorted(roles_lib.active_roles(db, RoleAssignment, ident.subject))}
+                "extension_roles": sorted(roles_lib.active_roles(db, RoleAssignment, ident.subject)),
+                "effective_roles": sorted(held),
+                "capabilities": {"loan_management": "operations_admin" in held,
+                                 "batch_operations": "batch_operator" in held,
+                                 "role_admin": "extension_admin" in held,
+                                 "legacy_reviewer_workflow": legacy}}
 
     # --- customer -----------------------------------------------------------------------------
 
@@ -325,27 +357,85 @@ def create_app(settings: Settings | None = None, *, adapter: AdapterClient | Non
 
     @app.get(f"{PREFIX}/review/applications")
     def review_queue(who: Staff = Depends(any_reviewer), status: str | None = Query(default=None),
-                     db: Session = Depends(get_db)):
+                     queue: str | None = Query(default=None, pattern=r"^(pending_review|pending_decision|decided|all)$"),
+                     q: str | None = Query(default=None, max_length=64), db: Session = Depends(get_db)):
         stmt = select(LoanApplication).where(LoanApplication.status != "draft")
-        if not who.has("approver", "extension_admin"):
+        if not who.has(*STAFF_VIEW):
             stmt = stmt.where(LoanApplication.reviewer_subject == who.subject)
         if status:
             stmt = stmt.where(LoanApplication.status == status)
-        else:
+        if queue == "pending_review":
+            stmt = stmt.where(or_(LoanApplication.status == "submitted",
+                                  and_(LoanApplication.status == "under_review",
+                                       LoanApplication.recommendation.is_(None))))
+        elif queue == "pending_decision":
+            stmt = stmt.where(LoanApplication.status == "under_review", LoanApplication.recommendation.is_not(None))
+        elif queue == "decided":
+            stmt = stmt.where(LoanApplication.status.in_(("approved", "rejected")))
+        elif not status and queue != "all":
             stmt = stmt.where(or_(LoanApplication.status.in_(OPEN_FOR_REVIEW), LoanApplication.decided_at.is_not(None)))
+        if q and q.strip():
+            needle = "%" + q.strip().lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            stmt = stmt.where(or_(func.lower(LoanApplication.owner_label).like(needle, escape="\\"),
+                                  func.lower(LoanApplication.account_masked).like(needle, escape="\\"),
+                                  LoanApplication.id == q.strip()))
         rows = db.scalars(stmt.order_by(LoanApplication.submitted_at.desc()).limit(200)).all()
         return {"items": [app_out(a, _latest_summary(db, a.id), staff=True) for a in rows]}
+
+    @app.get(f"{PREFIX}/review/stats")
+    def review_stats(_w: Staff = Depends(operations_admin), db: Session = Depends(get_db)):
+        """Real counts for the admin overview (no estimates)."""
+        counts = dict(db.execute(select(LoanApplication.status, func.count()).where(LoanApplication.status != "draft")
+                                 .group_by(LoanApplication.status)).all())
+        under = LoanApplication.status == "under_review"
+        pending_review = db.scalar(select(func.count()).select_from(LoanApplication).where(
+            or_(LoanApplication.status == "submitted", and_(under, LoanApplication.recommendation.is_(None))))) or 0
+        pending_decision = db.scalar(select(func.count()).select_from(LoanApplication).where(
+            under, LoanApplication.recommendation.is_not(None))) or 0
+        held = db.scalar(select(func.count()).select_from(LoanApplication).where(
+            _held_by_retired_reviewer(), LoanApplication.reviewer_subject.not_in(_admin_subjects()))) or 0
+        return {"by_status": {s: int(counts.get(s, 0)) for s in ("submitted", "under_review", "approved", "rejected")},
+                "pending_review": int(pending_review), "pending_decision": int(pending_decision),
+                "held_by_retired_reviewer": int(held), "legacy_workflow_enabled": legacy}
 
     @app.get(f"{PREFIX}/review/applications/{{app_id}}")
     def review_one(app_id: str, who: Staff = Depends(any_reviewer), db: Session = Depends(get_db)):
         a = _visible(db, who, app_id)
         events = db.scalars(select(LoanEvent).where(LoanEvent.application_id == a.id).order_by(LoanEvent.id)).all()
+        reviewer_is_admin = a.reviewer_subject is not None and db.scalar(
+            select(func.count()).select_from(RoleAssignment).where(
+                RoleAssignment.subject == a.reviewer_subject, RoleAssignment.role == roles_lib.OPERATIONS_ADMIN,
+                RoleAssignment.active.is_(True))) > 0
         return {**app_out(a, _latest_summary(db, a.id), staff=True),
+                "assignment": {"reviewer_subject": a.reviewer_subject,
+                               "reviewer_is_current_admin": bool(reviewer_is_admin),
+                               "held_by_retired_reviewer": bool(a.status == "under_review" and a.recommendation is None
+                                                                and a.reviewer_subject and not reviewer_is_admin)},
                 "events": [{"type": e.event_type, "actor": e.actor, "from": e.from_status, "to": e.to_status,
-                            "at": _ts(e.created_at)} for e in events]}
+                            "details": e.details or {}, "at": _ts(e.created_at)} for e in events]}
+
+    @app.post(f"{PREFIX}/review/applications/{{app_id}}/start-review")
+    def start_review(app_id: str, body: VersionBody, who: Staff = Depends(operations_admin),
+                     db: Session = Depends(get_db)):
+        """The Operations Admin takes the application (unassigned, or held by a retired reviewer)."""
+        a = _visible(db, who, app_id)
+        if a.owner_subject == who.subject:
+            raise ServiceError(409, "conflict_of_interest", "You cannot review your own application.")
+        if a.recommendation is not None:
+            raise ServiceError(409, "invalid_state", "A review recommendation already exists; take the final decision.")
+        previous = a.reviewer_subject
+        from_status = a.status
+        svc.transition(db, a, body.version, OPEN_FOR_REVIEW, {
+            "status": "under_review", "reviewer_subject": who.subject, "assigned_by": who.subject})
+        svc.event(db, a.id, "review_started", who.subject, from_status, "under_review", previous_reviewer=previous)
+        db.commit()
+        TRANSITIONS.labels("under_review").inc()
+        db.refresh(a)
+        return app_out(a, _latest_summary(db, a.id), staff=True)
 
     @app.post(f"{PREFIX}/review/applications/{{app_id}}/assign")
     def assign(app_id: str, body: AssignBody, who: Staff = Depends(assigner), db: Session = Depends(get_db)):
+        retired_workflow()
         a = _visible(db, who, app_id)
         if body.reviewer_subject == a.owner_subject:
             raise ServiceError(409, "conflict_of_interest", "The applicant cannot review their own application.")
@@ -362,9 +452,10 @@ def create_app(settings: Settings | None = None, *, adapter: AdapterClient | Non
         return app_out(a, _latest_summary(db, a.id), staff=True)
 
     @app.post(f"{PREFIX}/review/applications/{{app_id}}/recommendation")
-    def recommend(app_id: str, body: RecommendBody, who: Staff = Depends(reviewer), db: Session = Depends(get_db)):
+    def recommend(app_id: str, body: RecommendBody, who: Staff = Depends(recommender), db: Session = Depends(get_db)):
         a = db.get(LoanApplication, app_id) if len(app_id) <= 36 else None
-        if a is None or a.reviewer_subject != who.subject:          # assignment is mandatory
+        # The review must be started (Operations Admin) or assigned (legacy reviewer) to the caller.
+        if a is None or a.reviewer_subject != who.subject:
             raise ServiceError(404, "not_found", "Application not found.")
         if a.owner_subject == who.subject:
             raise ServiceError(409, "conflict_of_interest", "The applicant cannot review their own application.")
@@ -378,9 +469,14 @@ def create_app(settings: Settings | None = None, *, adapter: AdapterClient | Non
         return app_out(a, _latest_summary(db, a.id), staff=True)
 
     @app.post(f"{PREFIX}/review/applications/{{app_id}}/decision")
-    def decide(app_id: str, body: DecisionBody, who: Staff = Depends(approver), db: Session = Depends(get_db)):
+    def decide(app_id: str, body: DecisionBody, who: Staff = Depends(decider), db: Session = Depends(get_db)):
         a = _visible(db, who, app_id)
-        if who.subject in (a.reviewer_subject, a.owner_subject):
+        if who.subject == a.owner_subject:      # never on one's own application, for every role
+            raise ServiceError(409, "separation_of_duties",
+                               "The final decision must be taken by someone other than the applicant.")
+        # PoC simplification (owner's choice): an Operations Admin may decide an application they
+        # reviewed. The legacy approver keeps the original reviewer != decider rule.
+        if not who.has("operations_admin") and who.subject == a.reviewer_subject:
             raise ServiceError(409, "separation_of_duties",
                                "The final decision must be taken by someone other than the reviewer or the applicant.")
         if a.status == "under_review" and a.recommendation is None:
@@ -398,6 +494,7 @@ def create_app(settings: Settings | None = None, *, adapter: AdapterClient | Non
 
     @app.get(f"{PREFIX}/review/reviewers")
     def reviewers(_w: Staff = Depends(assigner), db: Session = Depends(get_db)):
+        retired_workflow()
         rows = db.scalars(select(RoleAssignment).where(RoleAssignment.role == "reviewer",
                                                        RoleAssignment.active.is_(True))).all()
         return {"items": [{"subject": r.subject, "label": r.label} for r in rows]}
