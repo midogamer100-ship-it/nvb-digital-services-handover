@@ -119,7 +119,9 @@ def test_core_admin_without_extension_role_gets_nothing(app, fake, sm):
     core_admin = browser(app, fake, "admin")                           # core role admin, no assignment yet
     assert core_admin.get(f"{B}/me").json() == {
         "subject": SUBJECTS["admin"], "username": "admin", "display_name": "admin", "core_role": "admin",
-        "extension_roles": []}
+        "extension_roles": [], "effective_roles": [],
+        "capabilities": {"loan_management": False, "batch_operations": False, "role_admin": False,
+                         "legacy_reviewer_workflow": False}}
     for method, path, body in (("get", "/review/applications", None), ("get", f"/review/applications/{a['id']}", None),
                                ("post", f"/review/applications/{a['id']}/decision",
                                 {"decision": "approved", "reason": REASON, "version": a["version"]}),
@@ -129,6 +131,7 @@ def test_core_admin_without_extension_role_gets_nothing(app, fake, sm):
     assert browser(app, fake, "alice").get(f"{B}/review/applications").status_code == 403
 
 
+@pytest.mark.legacy_reviewers
 def test_reviewer_sees_only_assigned_applications(app, fake, roles):
     a = under_review(app, fake, "rev1")
     other = submitted(app, fake, "bob")
@@ -144,6 +147,7 @@ def test_reviewer_sees_only_assigned_applications(app, fake, roles):
         == {a["id"], other["id"]}
 
 
+@pytest.mark.legacy_reviewers
 def test_assignment_rules(app, fake, roles, sm):
     a = submitted(app, fake)
     appr = browser(app, fake, "appr")
@@ -161,6 +165,7 @@ def test_assignment_rules(app, fake, roles, sm):
     assert ok["status"] == "under_review" and ok["reviewer_subject"] == SUBJECTS["rev1"]
 
 
+@pytest.mark.legacy_reviewers
 def test_recommendation_then_separate_decision(app, fake, roles, sm):
     a = recommended(app, fake, "approve")
     assert a["recommendation"] == "approve" and a["status"] == "under_review"
@@ -179,6 +184,7 @@ def test_recommendation_then_separate_decision(app, fake, roles, sm):
     assert all(e.created_at for e in events)
 
 
+@pytest.mark.legacy_reviewers
 def test_separation_of_duties(app, fake, roles, sm):
     a = recommended(app, fake)
     grant(sm, "rev1", "approver")                                       # the reviewer also holds approver
@@ -196,6 +202,7 @@ def test_separation_of_duties(app, fake, roles, sm):
                                            ).status_code == 403
 
 
+@pytest.mark.legacy_reviewers
 def test_invalid_transitions_and_required_reason(app, fake, roles):
     appr = browser(app, fake, "appr")
     a = submitted(app, fake)
@@ -221,6 +228,7 @@ def test_invalid_transitions_and_required_reason(app, fake, roles):
     assert again.status_code == 409 and again.json()["error"]["code"] == "invalid_state"   # terminal
 
 
+@pytest.mark.legacy_reviewers
 def test_stale_version_is_rejected(app, fake, roles):
     a = recommended(app, fake)
     appr = browser(app, fake, "appr")
@@ -230,6 +238,7 @@ def test_stale_version_is_rejected(app, fake, roles):
     assert appr.get(f"{B}/review/applications/{a['id']}").json()["status"] == "under_review"
 
 
+@pytest.mark.legacy_reviewers
 def test_approval_does_not_touch_the_core(app, fake, roles):
     """The only core-facing calls of the whole workflow are identity resolution (read-only)."""
     a = recommended(app, fake)
@@ -250,6 +259,7 @@ def test_approval_does_not_touch_the_core(app, fake, roles):
 # --- summary worker ---------------------------------------------------------------------------
 
 
+@pytest.mark.legacy_reviewers
 def test_summary_is_integer_only_and_labelled_synthetic(app, fake, sm, broker, worker, roles):
     a = under_review(app, fake)
     assert drain(sm, broker, worker) == ["completed"]
@@ -391,6 +401,7 @@ def test_scheduled_batch_command_uses_the_same_operation(app, fake, sm, settings
                                  idempotency_key="other-key-1", max_applications=0)
 
 
+@pytest.mark.legacy_reviewers
 def test_role_administration(app, fake, roles, sm):
     admin = browser(app, fake, "admin")
     r = admin.post(f"{B}/admin/roles/grant", json={"subject": SUBJECTS["bob"], "role": "reviewer", "label": "bob"})

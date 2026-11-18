@@ -17,7 +17,7 @@ from nvb_platform.broker import InMemoryBroker
 
 SUBJECTS = {"alice": "nvb-user:1:1700000000", "bob": "nvb-user:2:1700000001", "rev1": "nvb-user:11:1700000011",
             "rev2": "nvb-user:12:1700000012", "appr": "nvb-user:13:1700000013", "admin": "nvb-user:14:1700000014",
-            "ops": "nvb-user:15:1700000015"}
+            "ops": "nvb-user:15:1700000015", "desk": "nvb-user:16:1700000016", "desk2": "nvb-user:17:1700000017"}
 
 
 def account(account_id: int) -> dict:
@@ -73,10 +73,17 @@ def clean_env(monkeypatch):
             monkeypatch.delenv(k)
 
 
+def pytest_configure(config):
+    config.addinivalue_line("markers", "legacy_reviewers: run with LOANS_LEGACY_REVIEWER_WORKFLOW_ENABLED=true "
+                                       "(the retired reviewer/approver workflow, i.e. the rollback configuration)")
+
+
 @pytest.fixture
-def settings(tmp_path):
+def settings(tmp_path, request):
+    legacy = request.node.get_closest_marker("legacy_reviewers") is not None
     return Settings(database_url=f"sqlite:///{tmp_path / 'loans.db'}", allow_sqlite=True, log_level="WARNING",
-                    settle_seconds=0, retry_base_seconds=0, retry_max_seconds=0, max_attempts=3, idle_exit_seconds=0)
+                    settle_seconds=0, retry_base_seconds=0, retry_max_seconds=0, max_attempts=3, idle_exit_seconds=0,
+                    legacy_reviewer_workflow_enabled=legacy)
 
 
 @pytest.fixture
@@ -92,7 +99,7 @@ def fake():
     f = FakeAdapter()
     f.add("alice", "customer", [account(101), account(102)])
     f.add("bob", "customer", [account(201)])
-    for staff in ("rev1", "rev2", "appr", "ops"):
+    for staff in ("rev1", "rev2", "appr", "ops", "desk", "desk2"):
         f.add(staff, "admin", [])
     f.add("admin", "admin", [])
     return f
