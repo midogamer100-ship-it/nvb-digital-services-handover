@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     relay_poll_seconds: float = Field(default=1.0, gt=0, le=60)
     stale_requeue_seconds: int = Field(default=900, ge=30, le=86400)
 
+    # The separate reviewer/approver workflow is retired: the Operations Admin reviews and decides.
+    # true restores the legacy roles exactly as before (rollback switch); rows/history are never deleted.
+    legacy_reviewer_workflow_enabled: bool = False
+
     batch_max_applications: int = Field(default=5000, ge=1, le=200000)
     batch_max_retry_rounds: int = Field(default=3, ge=0, le=20)
 

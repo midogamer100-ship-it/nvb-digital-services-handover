@@ -22,6 +22,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 TEMPLATE = Path(__file__).with_name("nginx.conf.template")
+STATIC_BANK_ROOT = '        location / {\n            limit_except GET { deny all; }\n            root @@PORTAL_ROOT@@;\n            add_header Cache-Control "no-cache" always;\n            add_header X-Content-Type-Options "nosniff" always;\n            add_header X-Frame-Options "DENY" always;\n            add_header Referrer-Policy "no-referrer" always;\n            add_header Content-Security-Policy "default-src \'self\'; frame-ancestors \'none\'; base-uri \'none\'; form-action \'self\'" always;\n            add_header Strict-Transport-Security "max-age=31536000" always;\n            try_files $uri /index.html;\n        }'
 
 
 class ConfigError(SystemExit):
@@ -115,6 +116,29 @@ def render(env: dict) -> str:
     for name in ("WORKER_PROCESSES", "LOGIN_RATE", "LOGIN_BURST"):
         if not re.fullmatch(r"[0-9a-z/]+", values[name]):
             raise ConfigError(f"gateway configuration error: invalid GATEWAY_{name}")
+    # Explicit opt-in: serve the core banking SPA and its existing API under this origin.
+    # Public /internal, /metrics and /health locations remain denied by the template.
+    integrated = env.get("GATEWAY_BANK_UI", "false").lower() == "true"
+    if integrated:
+        api_location = (
+            "        location ^~ /api/ {\n"
+            "            if ($reject_origin) { return 403; }\n"
+            + core_tls + "\n            proxy_pass " + core + ";\n        }"
+        )
+        root_location = (
+            "        location = /digital { return 302 /digital/; }\n"
+            "        location = /digital/ { root " + values["PORTAL_ROOT"] + "; try_files /index.html =404; }\n"
+            "        location = /app.js { root " + values["PORTAL_ROOT"] + "; }\n"
+            "        location = /styles.css { root " + values["PORTAL_ROOT"] + "; }\n"
+            "        location / {\n"
+            "            limit_except GET { deny all; }\n"
+            + core_tls + "\n            proxy_pass " + core + ";\n        }"
+        )
+    else:
+        api_location = "        location ^~ /api/ { return 404; }"
+        root_location = STATIC_BANK_ROOT.replace("@@PORTAL_ROOT@@", values["PORTAL_ROOT"])
+    values["BANK_API_LOCATION"] = api_location
+    values["BANK_ROOT_LOCATION"] = root_location
     text = TEMPLATE.read_text(encoding="utf-8")
     for key_, value in values.items():
         text = text.replace(f"@@{key_}@@", value)

@@ -1,0 +1,56 @@
+name: Digital services CI
+on:
+  pull_request:
+  push:
+    branches: [main, 'feature/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: digital-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  local-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install isolated local test dependencies
+        run: |
+          python -m pip install -r services/core-adapter/requirements-dev.txt \
+            -r services/statements/requirements-dev.txt -r services/loans/requirements-dev.txt
+      - name: API, worker and Operations Admin tests with local doubles
+        run: python scripts/ci/local_tests.py
+  image-build:
+    needs: local-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - name: core-adapter
+            file: services/core-adapter/Containerfile
+          - name: statements
+            file: services/statements/Containerfile
+          - name: loans
+            file: services/loans/Containerfile
+          - name: gateway
+            file: gateway/Containerfile
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build only; no registry push or cluster access
+        env:
+          CONTAINERFILE: ${{ matrix.file }}
+          COMPONENT: ${{ matrix.name }}
+        run: |
+          docker build --file "$CONTAINERFILE" --build-arg "REVISION=$GITHUB_SHA" \
+            --build-arg "VERSION=sha-$GITHUB_SHA" --tag "nvb-$COMPONENT:ci" .

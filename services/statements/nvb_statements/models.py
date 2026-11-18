@@ -34,7 +34,8 @@ BATCH_STATUSES = ("freezing", "releasing", "running", "completed", "completed_wi
                   "failed")
 BATCH_TERMINAL = {"completed", "completed_with_failures", "cancelled", "failed"}
 # Extension roles known to THIS service. Core roles (customer/admin/demo) grant none of them.
-KNOWN_ROLES = frozenset({"batch_operator", "extension_admin"})
+# operations_admin (read-only statement operations view) is effective only for a core admin.
+KNOWN_ROLES = frozenset({"operations_admin", "batch_operator", "extension_admin"})
 BigIntPK = BigInteger().with_variant(Integer, "sqlite")
 
 

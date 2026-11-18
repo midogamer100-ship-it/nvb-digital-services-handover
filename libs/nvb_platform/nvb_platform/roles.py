@@ -58,6 +58,28 @@ def active_roles(db: Session, assignment_model, subject: str) -> frozenset[str]:
     return frozenset(rows)
 
 
+OPERATIONS_ADMIN = "operations_admin"
+LEGACY_REVIEW_ROLES = frozenset({"reviewer", "approver"})
+
+
+def effective_roles(raw: frozenset[str], core_role: str | None, *, legacy_roles: frozenset[str] = frozenset(),
+                    legacy_enabled: bool = False) -> frozenset[str]:
+    """Roles that actually authorize a request.
+
+    * ``operations_admin`` counts only when the trusted core identity (from introspection, never
+      a browser-supplied value) is a core ``admin``. A customer who somehow holds the assignment
+      row gets nothing from it.
+    * ``legacy_roles`` (the retired reviewer/approver workflow) count only while that workflow is
+      explicitly enabled. Assignment rows and their history are kept either way.
+    """
+    roles = set(raw)
+    if core_role != "admin":
+        roles.discard(OPERATIONS_ADMIN)
+    if not legacy_enabled:
+        roles -= legacy_roles
+    return frozenset(roles)
+
+
 def list_assignments(db: Session, assignment_model) -> list[dict]:
     rows = db.scalars(select(assignment_model).where(assignment_model.active.is_(True))
                       .order_by(assignment_model.subject, assignment_model.role)).all()
